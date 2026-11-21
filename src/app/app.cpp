@@ -1,0 +1,527 @@
+#include "app/app.h"
+
+#include <spdlog/spdlog.h>
+#include <imgui_impl_win32.h>
+
+#include <cmath>
+#include <cstring>
+#include <format>
+#include <set>
+#include <thread>
+
+#include <imgui.h>
+
+#include "core/util.h"
+
+// Declared under '#if 0' in imgui_impl_win32.h by design — forward-declare here.
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
+                                                             WPARAM wParam, LPARAM lParam);
+
+namespace app {
+
+namespace {
+constexpr int HK_MENU = 1;
+constexpr int HK_QUIT = 2;
+}
+
+int App::run(const config::Config& cfg) {
+  // Fabric intermediary names (1.21.x); MCP/Forge names come later via mappings.
+  targets_ = {
+      "net/minecraft/class_310",  // Minecraft / MinecraftClient
+      "net/minecraft/class_746",  // LocalPlayer
+      "net/minecraft/class_742",  // AbstractClientPlayer
+      "net/minecraft/class_1657", // Player
+      "net/minecraft/class_1297", // Entity
+  };
+
+  if (!win_.create(GetModuleHandleW(nullptr), L"Threshold overlay")) return 1;
+
+  win_.hook_ = [this](HWND h, UINT m, WPARAM wp, LPARAM lp, bool& handled) -> LRESULT {
+    if (m == WM_HOTKEY) {
+      if (wp == HK_MENU) {
+        menuOpen_ = !menuOpen_;
+        win_.setClickThrough(!menuOpen_);
+        handled = true;
+        return 0;
+      }
+      if (wp == HK_QUIT) {
+        quit_ = true;
+        handled = true;
+        return 0;
+      }
+    }
+    handled = ImGui_ImplWin32_WndProcHandler(h, m, wp, lp) != 0;
+    return 0;
+  };
+
+  if (!rend_.init(win_.hwnd(), 640, 400)) {
+    spdlog::error("renderer init failed");
+    win_.destroy();
+    return 1;
+  }
+
+  // Visible from the start: status panel while scanning; snaps to MC on attach.
+  menuOpen_ = true;
+  win_.setClickThrough(false);
+  win_.show(true);
+
+  RegisterHotKey(win_.hwnd(), HK_MENU, MOD_NOREPEAT, cfg.menuKey);
+  RegisterHotKey(win_.hwnd(), HK_QUIT, MOD_NOREPEAT, cfg.exitKey);
+  spdlog::info("overlay ready. INSERT - menu, END - quit");
+
+  MSG msg = {};
+  while (!quit_) {
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) quit_ = true;
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+      if (msg.message == WM_DESTROY) quit_ = true;
+    }
+    if (quit_) break;
+
+    if (attached_) {
+      if (!targetAlive()) {
+        spdlog::warn("Minecraft window/process lost - detaching");
+        detach();
+        continue;
+      }
+      pollTarget();
+    } else {
+      auto now = std::chrono::steady_clock::now();
+      if (now - lastScan_ > std::chrono::milliseconds(500)) {
+        lastScan_ = now;
+        tryAttach();
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    frame();
+  }
+
+  detach();
+  UnregisterHotKey(win_.hwnd(), HK_MENU);
+  UnregisterHotKey(win_.hwnd(), HK_QUIT);
+  rend_.shutdown();
+  win_.destroy();
+  return 0;
+}
+
+void App::tryAttach() {
+  auto cands = mc::findCandidates();
+  size_t javaCount = 0;
+  for (auto& c : cands)
+    if (c.hasJvm && c.is64Bit) ++javaCount;
+  spdlog::debug("scan: {} visible windows, {} java candidates", cands.size(), javaCount);
+
+  auto best = mc::pickBest(cands);
+  if (!best) return;
+  target_ = *best;
+
+  // Read-only attach by design; writes are opt-in per feature later.
+  if (!proc_.attach(best->pid, /*withWrite=*/false)) return;
+  if (!jvm_.resolve(proc_)) {
+    spdlog::error("attached to pid {} but jvm.dll analysis failed", best->pid);
+    detach();
+    return;
+  }
+  heap_.resolve(proc_, jvm_);
+
+  // Mappings for the game version (window title -> version -> table).
+  std::string version = mc::versionFromTitle(best->title);
+  model_.setGameVersion(version);
+  mapping_ = mc::loadMappings(config::appDir() / L"mappings", version);
+  targets_.clear();
+  {
+    std::set<std::string> s;
+    for (auto& [k, n] : mapping_.classes) s.insert(n);
+    targets_.assign(s.begin(), s.end());
+  }
+
+  attached_ = true;
+  menuOpen_ = false;
+  win_.show(true);
+  win_.setClickThrough(true);
+  spdlog::info("attached: pid={} window='{}' mappings='{}' ({} targets)", best->pid,
+               util::toUtf8(best->title),
+               mapping_.builtin ? "builtin " + mapping_.version : mapping_.version,
+               targets_.size());
+  startScan();
+}
+
+void App::startScan() {
+  if (scanState_.load() == 1) return;
+  pollScan();
+  scanCancel_ = false;
+  scanState_ = 1;
+  scanThread_ = std::thread([this] {
+    lastHeap_ = heap_.scan(proc_, jvm_, targets_, &scanCancel_);
+    if (lastHeap_.ok)
+      spdlog::info("heap scan: {} objects in {} regions ({:.1f}s), net/minecraft/*: {}, "
+                   "target hits: {}",
+                   lastHeap_.objectsSeen, lastHeap_.regionsScanned, lastHeap_.seconds,
+                   lastHeap_.mcObjects, lastHeap_.targetCounts.size());
+    else
+      spdlog::warn("heap scan failed: {}", lastHeap_.error);
+
+    // Locate the Minecraft class: instance object -> narrow klass id ->
+    // decoded InstanceKlass address; then init the navigation model.
+    mcKlass_ = 0;
+    auto mcName = mapping_.className("minecraft");
+    auto it = mcName ? lastHeap_.targetAddrs.find(*mcName) : lastHeap_.targetAddrs.end();
+    if (mcName && it != lastHeap_.targetAddrs.end() && !it->second.empty()) {
+      const jvm::JvmEnv& env = jvm_.env();
+      uint64_t obj = it->second.front();
+      if (env.compressedKlasses) {
+        auto id = proc_.read<uint32_t>(obj + 8);
+        if (id) mcKlass_ = env.narrowKlassBase + ((uint64_t)*id << env.narrowKlassShift);
+      } else {
+        auto k = proc_.read<uint64_t>(obj + 8);
+        if (k) mcKlass_ = *k;
+      }
+      spdlog::info("mc model: {} instance @ {}, klass @ {}", *mcName, util::hex(obj),
+                   util::hex(mcKlass_));
+      model_.init(proc_, jvm_, klassReader_, lastHeap_, heap_.heapStart(), heap_.heapEnd(),
+                  mapping_);
+    } else {
+      spdlog::warn("mc model: no '{}' instances found in scan", *mcName);
+    }
+    scanState_ = 2;
+  });
+}
+
+void App::pollScan() {
+  if (scanState_.load() == 2 && scanThread_.joinable()) {
+    scanThread_.join();
+    scanState_ = 0;
+  }
+}
+
+void App::dumpMcFields() {
+  if (!mcKlass_) {
+    spdlog::warn("dump fields: no class_310 klass yet (scan first)");
+    return;
+  }
+  klassReader_.dumpClass(proc_, jvm_, mcKlass_, "Minecraft");
+
+  // java/lang/String: tiny class with known fields — cracks the fi_stream
+  // format trivially.
+  if (auto arr = jvm_.vmClassesArray()) {
+    spdlog::debug("vmClasses array @ {}", util::hex(*arr));
+    for (int i = 0; i < 200; ++i) {
+      auto k = proc_.read<uint64_t>((uintptr_t)(*arr + (uint64_t)i * 8));
+      if (!k || !*k || *k < 0x10000) continue;
+      const jvm::JvmEnv& env = jvm_.env();
+      auto sym = proc_.read<uint64_t>((uintptr_t)(*k + env.offKlassName));
+      if (!sym || !*sym) continue;
+      auto name = jvm_.readSymbol(proc_, *sym);
+      if (!name) continue;
+      if (i < 30) spdlog::debug("vmClass[{}] = '{}' @ {}", i, *name, util::hex(*k));
+      if (*name == "java/lang/Thread") {
+        klassReader_.dumpClass(proc_, jvm_, *k, "java/lang/Thread");
+        break;
+      }
+    }
+  }
+}
+
+void App::detach() {
+  if (attached_) {
+    spdlog::info("detached");
+    attached_ = false;
+  }
+  scanCancel_ = true;
+  if (scanThread_.joinable()) scanThread_.join();
+  scanState_ = 0;
+  win_.show(false);
+  proc_.detach();
+  jvm_.reset();
+  heap_ = {};
+  model_ = {};
+  mapping_ = {};
+  target_ = {};
+  lastScan_ = std::chrono::steady_clock::now();
+}
+
+bool App::targetAlive() {
+  if (!IsWindow(target_.hwnd)) return false;
+  DWORD pid = 0;
+  GetWindowThreadProcessId(target_.hwnd, &pid);
+  return pid == target_.pid && proc_.valid();
+}
+
+void App::pollTarget() {
+  RECT rc = {};
+  if (!GetClientRect(target_.hwnd, &rc)) return;
+  POINT tl = {0, 0};
+  ClientToScreen(target_.hwnd, &tl);
+  int w = rc.right - rc.left;
+  int h = rc.bottom - rc.top;
+  if (w <= 0 || h <= 0) return;
+  win_.setBounds(tl.x, tl.y, w, h);
+  rend_.resize(w, h);
+}
+
+void App::frame() {
+  pollScan(); // join finished background scan before touching its results
+  espEnabled_ = menuState_.espEnabled;
+  fillMenuState();
+  rend_.beginFrame();
+  if (espEnabled_ && attached_ && model_.valid()) drawEsp();
+  if (menuOpen_) menu_.draw(menuState_);
+  rend_.endFrame();
+}
+
+// Project world -> screen with a view-projection matrix built from the
+// camera basis (position + forwards/up/left) and a vertical FOV of 70 deg.
+static bool projectPoint(const float view[16], const float proj[16], double x, double y,
+                         double z, int w, int h, ImVec2* out) {
+  // view transform
+  double vx = view[0] * x + view[4] * y + view[8] * z + view[12];
+  double vy = view[1] * x + view[5] * y + view[9] * z + view[13];
+  double vz = view[2] * x + view[6] * y + view[10] * z + view[14];
+  double vw = view[3] * x + view[7] * y + view[11] * z + view[15];
+  // projection
+  double px = proj[0] * vx + proj[4] * vy + proj[8] * vz + proj[12] * vw;
+  double py = proj[1] * vx + proj[5] * vy + proj[9] * vz + proj[13] * vw;
+  double pw = proj[3] * vx + proj[7] * vy + proj[11] * vz + proj[15] * vw;
+  if (pw <= 0.001) return false;
+  out->x = (float)((px / pw * 0.5 + 0.5) * w);
+  out->y = (float)((1.0 - (py / pw * 0.5 + 0.5)) * h);
+  return true;
+}
+
+void App::drawEsp() {
+  mc::CameraSnapshot cam;
+  if (!model_.readCamera(proc_, cam) || !cam.valid) {
+    menuState_.espError = "camera read failed";
+    return;
+  }
+  std::vector<mc::EspEntity> ents;
+  if (!model_.readEntities(proc_, ents)) {
+    menuState_.espError = "entity list read failed";
+    return;
+  }
+  menuState_.espError.clear();
+  menuState_.espEntities = ents.size();
+
+  // apply category + distance filters from the menu
+  ents.erase(std::remove_if(ents.begin(), ents.end(),
+                            [&](const mc::EspEntity& e) {
+                              double mx = (e.bbMin[0] + e.bbMax[0]) * 0.5;
+                              double my = (e.bbMin[1] + e.bbMax[1]) * 0.5;
+                              double mz = (e.bbMin[2] + e.bbMax[2]) * 0.5;
+                              double ddx = mx - cam.pos[0], ddy = my - cam.pos[1],
+                                     ddz = mz - cam.pos[2];
+                              double dst = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                              if (dst > menuState_.espDistance) return true;
+                              if (e.self) return false; // self always shown
+                              switch (e.category) {
+                                case (int)mc::EntCat::Mob:
+                                  return !menuState_.espShowMobs;
+                                case (int)mc::EntCat::Player:
+                                  return !menuState_.espShowPlayers;
+                                case (int)mc::EntCat::Item:
+                                  return !menuState_.espShowItems;
+                                default:
+                                  return !menuState_.espShowMisc;
+                              }
+                            }),
+            ents.end());
+  menuState_.espEntities = ents.size();
+
+  ImVec2 winPos, winSize;
+  {
+    RECT rc = {};
+    GetClientRect(target_.hwnd, &rc);
+    POINT tl = {0, 0};
+    ClientToScreen(target_.hwnd, &tl);
+    winPos = ImVec2((float)tl.x, (float)tl.y);
+    winSize = ImVec2((float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
+  }
+  int w = (int)winSize.x, h = (int)winSize.y;
+  if (w <= 0 || h <= 0) return;
+
+  // view matrix rows: right = -left, up, -forward (right-handed, -Z forward)
+  float r[3] = {-cam.left[0], -cam.left[1], -cam.left[2]};
+  float u[3] = {cam.up[0], cam.up[1], cam.up[2]};
+  float f[3] = {cam.forwards[0], cam.forwards[1], cam.forwards[2]};
+  float view[16] = {
+      r[0],        u[0],        -f[0],        0.f,
+      r[1],        u[1],        -f[1],        0.f,
+      r[2],        u[2],        -f[2],        0.f,
+      0.f,         0.f,         0.f,          1.f,
+  };
+  float px = 0, py = 0, pz = 0;
+  // translation column: -R * pos
+  px = -(r[0] * cam.pos[0] + r[1] * cam.pos[1] + r[2] * cam.pos[2]);
+  py = -(u[0] * cam.pos[0] + u[1] * cam.pos[1] + u[2] * cam.pos[2]);
+  pz = (f[0] * cam.pos[0] + f[1] * cam.pos[1] + f[2] * cam.pos[2]);
+  view[12] = px;
+  view[13] = py;
+  view[14] = pz;
+
+  // re-read the game FOV every 5 seconds: file first, then heap chain
+  auto nowFov = std::chrono::steady_clock::now();
+  if (!menuState_.espFovOverridden &&
+      std::chrono::duration<double>(nowFov - lastFovRead_).count() > 5.0) {
+    lastFovRead_ = nowFov;
+    cachedFov_ = model_.readFovFromFile(proc_);
+    if (cachedFov_ <= 70.1f && cachedFov_ >= 69.9f) cachedFov_ = model_.readFov(proc_);
+  }
+  float fovDeg = menuState_.espFovOverridden ? menuState_.espFov : cachedFov_;
+  menuState_.espFov = fovDeg; // show the effective value in the menu
+  float fovY = fovDeg * 3.14159265f / 180.f;
+  float aspect = (float)w / (float)h;
+  float tz = 1.f / std::tan(fovY * 0.5f);
+  float farZ = 1000.f, nearZ = 0.05f;
+  float proj[16] = {0};
+  proj[0] = tz / aspect;
+  proj[5] = tz;
+  proj[10] = farZ / (nearZ - farZ);
+  proj[11] = -1.f;
+  proj[14] = nearZ * farZ / (nearZ - farZ);
+
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  ImU32 colorTxt = IM_COL32(255, 255, 255, 230);
+
+  // category colors
+  static const ImU32 catColors[(int)mc::EntCat::Count] = {
+      IM_COL32(255, 60, 60, 230),   // Mob      — red
+      IM_COL32(60, 130, 255, 230),  // Player   — blue
+      IM_COL32(180, 180, 180, 200), // ArmorStand — gray
+      IM_COL32(255, 150, 40, 210),  // Projectile — orange
+      IM_COL32(255, 220, 60, 210),  // Item     — yellow
+      IM_COL32(60, 255, 120, 210),  // Living   — green
+      IM_COL32(220, 220, 220, 190), // Misc     — white
+  };
+  static const char* catNames[(int)mc::EntCat::Count] = {"Mob", "Player", "ArmorStand",
+                                                         "Projectile", "Item", "Living",
+                                                         "Other"};
+
+  // tick-rate interpolation: MC entities update positions at 20 tps; the
+  // renderer interpolates with partialTicks. Track the player position change
+  // to estimate the tick phase, then extrapolate every entity the same way.
+  auto now = std::chrono::steady_clock::now();
+  mc::EntitySnapshot ps;
+  if (model_.readPlayer(proc_, ps) && ps.valid) {
+    if (hasLastPlayer_ &&
+        (std::abs(ps.x - lastPlayer_.x) > 1e-9 || std::abs(ps.y - lastPlayer_.y) > 1e-9 ||
+         std::abs(ps.z - lastPlayer_.z) > 1e-9))
+      lastPosChange_ = now;
+    lastPlayer_ = ps;
+    hasLastPlayer_ = true;
+  }
+  double partial = std::chrono::duration<double>(now - lastPosChange_).count() / 0.05;
+  partial = std::clamp(partial, 0.0, 1.15);
+
+  double cx2 = cam.pos[0], cy2 = cam.pos[1], cz2 = cam.pos[2];
+  for (auto& e : ents) {
+    // extrapolate: cur + (cur - prev) * partialTick
+    double dx = (e.cur[0] - e.prev[0]) * partial;
+    double dy = (e.cur[1] - e.prev[1]) * partial;
+    double dz = (e.cur[2] - e.prev[2]) * partial;
+    // project the 8 AABB corners, shifted by the extrapolation delta
+    ImVec2 minS(1e9f, 1e9f), maxS(-1e9f, -1e9f);
+    int okCount = 0;
+    for (int c = 0; c < 8; ++c) {
+      double cx = ((c & 1) ? e.bbMax[0] : e.bbMin[0]) + dx;
+      double cy = ((c & 2) ? e.bbMax[1] : e.bbMin[1]) + dy;
+      double cz = ((c & 4) ? e.bbMax[2] : e.bbMin[2]) + dz;
+      ImVec2 s;
+      if (projectPoint(view, proj, cx, cy, cz, w, h, &s)) {
+        ++okCount;
+        minS.x = std::min(minS.x, s.x);
+        minS.y = std::min(minS.y, s.y);
+        maxS.x = std::max(maxS.x, s.x);
+        maxS.y = std::max(maxS.y, s.y);
+      }
+    }
+    if (okCount < 8) continue; // fully or partially behind the camera
+    if (maxS.x - minS.x < 2 || maxS.y - minS.y < 2) continue;
+
+    ImU32 color = e.self ? IM_COL32(255, 255, 255, 200) : catColors[e.category & 7];
+    dl->AddRect(ImVec2(winPos.x + minS.x, winPos.y + minS.y),
+                ImVec2(winPos.x + maxS.x, winPos.y + maxS.y), color, 0.f, 0, 1.5f);
+
+    // center for distance
+    double mx = ((e.bbMin[0] + e.bbMax[0]) * 0.5) + dx;
+    double my = ((e.bbMin[1] + e.bbMax[1]) * 0.5) + dy;
+    double mz = ((e.bbMin[2] + e.bbMax[2]) * 0.5) + dz;
+    double dist = std::sqrt((mx - cx2) * (mx - cx2) + (my - cy2) * (my - cy2) +
+                            (mz - cz2) * (mz - cz2));
+
+    const char* cls = e.className.c_str();
+    if (const char* slash = std::strrchr(cls, '/')) cls = slash + 1;
+    auto label = std::format("[{}] {} {:.0f}m", e.self ? "You" : catNames[e.category & 7],
+                             e.self ? "" : cls, dist);
+    dl->AddText(ImVec2(winPos.x + minS.x, winPos.y + minS.y - 14.f), colorTxt, label.c_str());
+  }
+}
+
+void App::fillMenuState() {
+  auto& st = menuState_;
+  st.attached = attached_;
+  st.jvmOk = jvm_.ok();
+  st.pid = target_.pid;
+  st.windowTitle = util::toUtf8(target_.title);
+  st.processPath = util::abbreviatePath(util::toUtf8(target_.processPath), 48);
+  st.jdkVersion = jvm_.version().raw.empty() ? "unknown" : jvm_.version().raw;
+  st.mappingsLine = mapping_.builtin ? mapping_.version + " (builtin)" : mapping_.version;
+  st.vmStructEntries = jvm_.structs().count();
+  st.jvmModuleLine = jvm_.ok()
+                         ? util::hex(jvm_.module().base) + " / " +
+                               std::to_string(jvm_.module().size / (1024 * 1024)) + " MB"
+                         : "-";
+  st.statusLine = attached_ ? (jvm_.ok() ? (scanState_.load() == 1
+                                               ? "attached - scanning heap..."
+                                               : "attached - jvm resolved")
+                                         : "attached - jvm unresolved")
+                            : "searching for Minecraft...";
+
+  st.keyOffsets.clear();
+  auto addField = [&](const char* t, const char* f) {
+    if (auto v = jvm_.structs().field(t, f))
+      st.keyOffsets.push_back({std::string(t) + "::" + f, std::format("0x{:X}", (int64_t)*v)});
+  };
+  auto addStatic = [&](const char* t, const char* f) {
+    if (auto v = jvm_.structs().staticDatum(t, f))
+      st.keyOffsets.push_back({std::string(t) + "::" + f + " @", util::hex(*v)});
+  };
+  addField("oopDesc", "_mark");
+  addField("Klass", "_layout_helper");
+  addField("InstanceKlass", "_fields");
+  addField("Symbol", "_length");
+  addField("Symbol", "_body");
+  addStatic("Universe", "_collectedHeap");
+  addStatic("Universe", "_narrow_oop_base");
+
+  // heap
+  // player
+  mc::EntitySnapshot es;
+  if (attached_ && model_.valid() && model_.readPlayer(proc_, es) && es.valid) {
+    st.playerValid = true;
+    st.playerLine = std::format("x {:.2f}  y {:.2f}  z {:.2f}   yaw {:.1f}  pitch {:.1f}", es.x,
+                                es.y, es.z, es.yaw, es.pitch);
+  } else {
+    st.playerValid = attached_ && model_.valid();
+    st.playerLine = es.error.empty() ? "-" : es.error;
+  }
+
+  st.heapOk = heap_.ready() && lastHeap_.ok;
+  st.heapG1 = heap_.g1();
+  st.heapSizeMode = heap_.calibratedMode();
+  st.heapLine = lastHeap_.ok
+                    ? std::format("{} regions, {} objects, {:.1f}s", lastHeap_.regionsScanned,
+                                  lastHeap_.objectsSeen, lastHeap_.seconds)
+                    : (lastHeap_.error.empty() ? "-" : lastHeap_.error);
+  st.mcObjects = lastHeap_.mcObjects;
+  st.targetHits.assign(lastHeap_.targetCounts.begin(), lastHeap_.targetCounts.end());
+  st.onRescan = [this]() { startScan(); };
+  st.onDump = [this]() {
+    for (const char* f : {"G1CollectedHeap", "HeapRegion", "GrowableArray", "CollectedHeap",
+                          "MemRegion", "oopDesc", "arrayOop", "Klass", "Universe"})
+      jvm_.dumpMatches(f);
+  };
+  st.onDumpFields = [this]() { dumpMcFields(); };
+}
+
+} // namespace app

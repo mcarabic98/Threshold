@@ -1,0 +1,10 @@
+build/
+external/
+tools/
+*.log
+imgui.ini
+threshold_imgui.ini
+config.json
+.vs/
+compile_commands.json
+*.html

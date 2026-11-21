@@ -1,0 +1,29 @@
+{
+  "version": "1.21.1",
+  "loader": "intermediary",
+  "classes": {
+    "minecraft": "net/minecraft/class_310",
+    "localPlayer": "net/minecraft/class_746",
+    "abstractClientPlayer": "net/minecraft/class_742",
+    "player": "net/minecraft/class_1657",
+    "livingEntity": "net/minecraft/class_1309",
+    "entity": "net/minecraft/class_1297",
+    "clientLevel": "net/minecraft/class_638",
+    "vec3": "net/minecraft/class_243",
+    "aabb": "net/minecraft/class_238",
+    "gameRenderer": "net/minecraft/class_757",
+    "camera": "net/minecraft/class_4184",
+    "entityStorage": "net/minecraft/class_5574"
+  },
+  "fields": {
+    "player": { "owner": "minecraft", "name": "field_1724", "type": "Lnet/minecraft/class_746;" },
+    "level": { "owner": "minecraft", "name": "field_1687", "type": "Lnet/minecraft/class_638;" },
+    "levelRenderer": { "owner": "minecraft", "name": "field_1769", "type": "Lnet/minecraft/class_761;" },
+    "gameRenderer": { "owner": "minecraft", "name": "field_1773", "type": "Lnet/minecraft/class_757;" },
+    "camera": { "owner": "gameRenderer", "name": "field_18765", "type": "Lnet/minecraft/class_4184;" },
+    "entitiesLookup": { "owner": "clientLevel", "name": "field_27733", "type": "Lnet/minecraft/class_5574;" },
+    "position": { "owner": "entity", "name": "field_22467", "type": "Lnet/minecraft/class_243;" },
+    "yRot": { "owner": "entity", "name": "field_6031", "type": "F" },
+    "xRot": { "owner": "entity", "name": "field_5965", "type": "F" }
+  }
+}
