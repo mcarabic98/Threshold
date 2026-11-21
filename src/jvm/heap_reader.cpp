@@ -88,38 +88,13 @@ bool HeapReader::resolve(const mem::Process& p, JvmRuntime& rt) {
       g1Ready_ ? "ready" : "missing", offG1Hrm_, offHrmRegions_, offGarrData_, offGarrLen_,
       offRegionBottom_, offRegionTop_);
 
-  // Fallback: CollectedHeap::_reserved (MemRegion _start + _byte_size; older
-  // JDKs expose _end instead). MemRegion fields may be absent from VMStructs
-  // entirely (JDK 21) - then the fallback stays off.
-  auto res = st.field("CollectedHeap", "_reserved");
-  auto ms = st.field("MemRegion", "_start");
-  auto me = st.field("MemRegion", "_end");
-  auto mb = st.field("MemRegion", "_byte_size");
-  if (res && ms) {
-    auto s = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res + *ms));
-    if (s && *s) {
-      bool haveEnd = false;
-      uint64_t end = 0;
-      if (me) {
-        auto e = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res + *me));
-        if (e) {
-          end = *e;
-          haveEnd = true;
-        }
-      }
-      if (!haveEnd && mb) {
-        auto sz = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res + *mb));
-        if (sz) {
-          end = *s + *sz;
-          haveEnd = true;
-        }
-      }
-      if (haveEnd && end > *s) {
-        heapStart_ = *s;
-        heapEnd_ = end;
-        fallbackReady_ = true;
-      }
-    }
+  // Fallback: CollectedHeap::_reserved as [start, end). JDK 21 dropped the
+  // MemRegion VMStructs entries, so the raw pair is parsed directly — the
+  // range is also what scopes the oop-decode hypotheses downstream.
+  if (auto rr = reservedRange(p, rt)) {
+    heapStart_ = rr->first;
+    heapEnd_ = rr->second;
+    fallbackReady_ = true;
   }
   spdlog::info("heap: fallback linear scan {} [{} .. {}]",
                fallbackReady_ ? "ready" : "missing", util::hex(heapStart_),
@@ -188,23 +163,13 @@ HeapReader::RegionList HeapReader::collectRegions(const mem::Process& p,
     return rl;
   }
   rl.ok = true;
-  // Java heap range from CollectedHeap::_reserved — used to reject bogus
-  // spans that fall outside the heap.
+  // Java heap range — used to reject bogus spans that fall outside the heap.
   uint64_t heapLo = 0, heapHi = 0;
-  if (auto res = st.field("CollectedHeap", "_reserved")) {
-    auto v0 = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res));
-    auto v1 = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res + 8));
-    if (v0 && v1 && *v0) {
-      if (*v1 > (1u << 20) && *v1 < (1ull << 36) && *v1 % (2u << 20) == 0) {
-        heapLo = *v0;
-        heapHi = *v0 + *v1;
-      } else if (*v1 > *v0) {
-        heapLo = *v0;
-        heapHi = *v1;
-      }
-      if (!rlHistDumped_)
-        spdlog::debug("heap: reserved range [{} .. {}]", util::hex(heapLo), util::hex(heapHi));
-    }
+  if (auto rr = reservedRange(p, rt)) {
+    heapLo = rr->first;
+    heapHi = rr->second;
+    if (!rlHistDumped_)
+      spdlog::debug("heap: reserved range [{} .. {}]", util::hex(heapLo), util::hex(heapHi));
   }
   auto tagOff = st.field("HeapRegion", "_type");
   std::map<uint32_t, int> tagHist;
@@ -233,6 +198,27 @@ HeapReader::RegionList HeapReader::collectRegions(const mem::Process& p,
     spdlog::debug("heap: {} usable regions, tag histogram: {}", rl.size(), hist);
   }
   return rl;
+}
+
+std::optional<std::pair<uint64_t, uint64_t>> HeapReader::reservedRange(
+    const mem::Process& p, const JvmRuntime& rt) const {
+  if (!collectedHeap_) return std::nullopt;
+  auto res = rt.structs().field("CollectedHeap", "_reserved");
+  if (!res) return std::nullopt;
+  // MemRegion {_start, _byte_size} (JDK 21+) or {_start, _end} (older).
+  auto v0 = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res));
+  auto v1 = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res + 8));
+  if (!v0 || !v1 || !*v0) return std::nullopt;
+  uint64_t lo = 0, hi = 0;
+  if (*v1 > (1u << 20) && *v1 < (1ull << 36) && *v1 % (2u << 20) == 0) {
+    lo = *v0;
+    hi = *v0 + *v1;
+  } else if (*v1 > *v0) {
+    lo = *v0;
+    hi = *v1;
+  }
+  if (!lo || hi <= lo) return std::nullopt;
+  return std::make_pair(lo, hi);
 }
 
 std::map<uint64_t, size_t> HeapReader::sampleKlassIds(const mem::Process& p,
@@ -542,11 +528,8 @@ void HeapReader::walkRegion(uint64_t bottom, uint64_t top, WalkCtx& ctx, ScanSta
                              ? env.narrowKlassBase + (kid << env.narrowKlassShift)
                              : kid;
           const KlassInfo& ki = resolve(key, ctx, st, p, rt, targets);
-            spdlog::debug("heap: findStart at probe: mark=0x{:X} kid=0x{:X} valid={}", mark, kid,
-                          ki.valid);
           if (ki.valid) return scan;
         }
-        spdlog::debug("heap: findStart at probe: mark=0x{:X} (mark filter failed)", mark);
       }
       scan += word;
     }
@@ -817,6 +800,22 @@ HeapScanResult HeapReader::scan(const mem::Process& p, const JvmRuntime& rt,
   r.ok = r.objectsSeen > 0;
   if (!r.ok && r.error.empty()) r.error = "no objects found";
   return r;
+}
+
+std::string HeapReader::regionSummary(const mem::Process& p, const JvmRuntime& rt,
+                                      uint64_t addr) const {
+  if (!addr) return "addr=0";
+  RegionList rl = collectRegions(p, rt);
+  if (!rl.ok) return "regions unavailable (" + rl.error + ")";
+  auto plausible = [](uint32_t t) { return t == 2 || t == 3 || t == 8; };
+  for (size_t i = 0; i < rl.size(); ++i) {
+    if (addr >= rl.bottoms[i] && addr < rl.tops[i]) {
+      return std::format("region {}/{} [{} .. {}] tag={:X}{}", i + 1, rl.size(),
+                         util::hex(rl.bottoms[i]), util::hex(rl.tops[i]), rl.tags[i],
+                         plausible(rl.tags[i]) ? " (walk covers it)" : " (SKIPPED by walk)");
+    }
+  }
+  return "not inside any listed region";
 }
 
 } // namespace jvm

@@ -151,6 +151,11 @@ void App::startScan() {
   if (scanState_.load() == 1) return;
   pollScan();
   scanCancel_ = false;
+  {
+    wchar_t t[256]{};
+    GetWindowTextW(target_.hwnd, t, 256);
+    lastScanTitle_ = t;
+  }
   scanState_ = 1;
   scanThread_ = std::thread([this] {
     lastHeap_ = heap_.scan(proc_, jvm_, targets_, &scanCancel_);
@@ -163,27 +168,20 @@ void App::startScan() {
       spdlog::warn("heap scan failed: {}", lastHeap_.error);
 
     // Locate the Minecraft class: instance object -> narrow klass id ->
-    // decoded InstanceKlass address; then init the navigation model.
-    mcKlass_ = 0;
+    // decoded InstanceKlass address; then init the navigation model. The
+    // sequential walk occasionally misses the singleton entirely (skipped
+    // region tag, resync gap) — recover it from GameRenderer's back-reference.
     auto mcName = mapping_.className("minecraft");
-    auto it = mcName ? lastHeap_.targetAddrs.find(*mcName) : lastHeap_.targetAddrs.end();
-    if (mcName && it != lastHeap_.targetAddrs.end() && !it->second.empty()) {
-      const jvm::JvmEnv& env = jvm_.env();
-      uint64_t obj = it->second.front();
-      if (env.compressedKlasses) {
-        auto id = proc_.read<uint32_t>(obj + 8);
-        if (id) mcKlass_ = env.narrowKlassBase + ((uint64_t)*id << env.narrowKlassShift);
-      } else {
-        auto k = proc_.read<uint64_t>(obj + 8);
-        if (k) mcKlass_ = *k;
-      }
-      spdlog::info("mc model: {} instance @ {}, klass @ {}", *mcName, util::hex(obj),
-                   util::hex(mcKlass_));
-      model_.init(proc_, jvm_, klassReader_, lastHeap_, heap_.heapStart(), heap_.heapEnd(),
-                  mapping_);
-    } else {
+    bool haveMc = mcName && !lastHeap_.targetAddrs[*mcName].empty();
+    if (!haveMc && mcName) haveMc = recoverMcSingleton();
+    if (haveMc) {
+      initModelFromScan();
+    } else if (mcName) {
       spdlog::warn("mc model: no '{}' instances found in scan", *mcName);
+    } else {
+      spdlog::warn("mc model: mappings define no 'minecraft' class");
     }
+    lastScanEnd_ = std::chrono::steady_clock::now();
     scanState_ = 2;
   });
 }
@@ -192,6 +190,214 @@ void App::pollScan() {
   if (scanState_.load() == 2 && scanThread_.joinable()) {
     scanThread_.join();
     scanState_ = 0;
+  }
+}
+
+bool App::initModelFromScan() {
+  auto mcName = mapping_.className("minecraft");
+  if (!mcName) return false;
+  auto& addrs = lastHeap_.targetAddrs[*mcName];
+  if (addrs.empty()) return false;
+
+  const jvm::JvmEnv& env = jvm_.env();
+  uint64_t obj = addrs.front();
+  if (env.compressedKlasses) {
+    auto id = proc_.read<uint32_t>(obj + 8);
+    if (!id) return false;
+    mcKlass_ = env.narrowKlassBase + ((uint64_t)*id << env.narrowKlassShift);
+  } else {
+    auto k = proc_.read<uint64_t>(obj + 8);
+    if (!k) return false;
+    mcKlass_ = *k;
+  }
+  spdlog::info("mc model: {} instance @ {}, klass @ {}", *mcName, util::hex(obj),
+               util::hex(mcKlass_));
+  bool ok = model_.init(proc_, jvm_, klassReader_, lastHeap_, heap_.heapStart(), heap_.heapEnd(),
+                        mapping_);
+  if (ok) autoRescans_ = 0;
+  return ok;
+}
+
+// The sequential walk can miss the Minecraft singleton entirely: its region
+// may fall outside the tag filter, or the walk desyncs around it. Missing one
+// or two singleton objects does not justify a slower walk — instead recover
+// the instance from objects the walk does find reliably: GameRenderer holds
+// the only field typed L<class_310>; back-reference.
+bool App::recoverMcSingleton() {
+  auto mcName = mapping_.className("minecraft");
+  if (!mcName) return false;
+  if (!lastHeap_.targetAddrs[*mcName].empty()) return true;
+  auto grName = mapping_.className("gameRenderer");
+  if (!grName) return false;
+  auto& grs = lastHeap_.targetAddrs[*grName];
+  if (grs.empty()) {
+    spdlog::warn("mc model: recovery anchor '{}' not found in scan either", *grName);
+    return false;
+  }
+
+  const jvm::JvmEnv& env = jvm_.env();
+  const std::string mcDesc = "L" + *mcName + ";";
+  uint64_t heapLo = heap_.heapStart(), heapHi = heap_.heapEnd();
+
+  for (size_t gi = 0; gi < grs.size() && gi < 4; ++gi) {
+    uint64_t gr = grs[gi];
+
+    // GameRenderer klass -> field table -> the oop field typed as Minecraft.
+    uint64_t grKlass = 0;
+    if (env.compressedKlasses) {
+      auto k = proc_.read<uint32_t>(gr + 8);
+      if (!k) continue;
+      grKlass = env.narrowKlassBase + ((uint64_t)*k << env.narrowKlassShift);
+    } else {
+      auto k = proc_.read<uint64_t>(gr + 8);
+      if (!k) continue;
+      grKlass = *k;
+    }
+    std::vector<jvm::FieldDesc> fs;
+    std::string err;
+    if (!klassReader_.readFields(proc_, jvm_, grKlass, fs, &err)) {
+      spdlog::debug("mc model: recovery: fields of GameRenderer klass {} failed: {}",
+                    util::hex(grKlass), err);
+      continue;
+    }
+    const jvm::FieldDesc* ref = nullptr;
+    for (auto& f : fs)
+      if (!f.isStatic && f.descriptor == mcDesc) ref = &f;
+    if (!ref) continue;
+    spdlog::info("mc model: recovery: '{}' instance @ {} holds back-ref '{}' at +{}",
+                 *grName, util::hex(gr), ref->name, ref->offset);
+
+    // The heap-oop decode may not be settled yet — try the standard
+    // hypotheses and validate each candidate by decoding its klass.
+    uint64_t rawVal = 0;
+    if (env.compressedOops) {
+      if (auto r = proc_.read<uint32_t>(gr + ref->offset)) rawVal = *r;
+    } else {
+      if (auto r = proc_.read<uint64_t>(gr + ref->offset)) rawVal = *r;
+    }
+    if (rawVal == 0) {
+      spdlog::debug("mc model: recovery: back-ref oop is null at {}+{} (stale instance?)",
+                    util::hex(gr), ref->offset);
+      continue;
+    }
+
+    std::vector<std::pair<uint64_t, int>> hypos;
+    if (env.compressedOops) {
+      if (env.narrowOopBase != 0 || env.narrowOopShift != 0)
+        hypos.emplace_back(env.narrowOopBase, env.narrowOopShift);
+      hypos.emplace_back(0, 3);
+      if (heapLo) {
+        hypos.emplace_back(heapLo, 0);
+        hypos.emplace_back(heapLo, 3);
+      }
+    } else {
+      hypos.emplace_back(0, 0); // uncompressed oops need no decode
+    }
+
+    for (auto& [base, shift] : hypos) {
+      uint64_t addr = env.compressedOops ? base + (rawVal << shift) : rawVal;
+      if (heapLo && (addr < heapLo || addr >= heapHi)) {
+        spdlog::debug("mc model: recovery: base=0x{:X} shift={} -> {} outside heap range",
+                      base, shift, util::hex(addr));
+        continue;
+      }
+
+      auto mark = proc_.read<uint64_t>(addr);
+      auto kid = proc_.read<uint32_t>(addr + 8);
+      if (!kid || !*kid) {
+        spdlog::debug("mc model: recovery: base=0x{:X} shift={} -> {} unreadable or kid=0",
+                      base, shift, util::hex(addr));
+        continue;
+      }
+      uint64_t k2 = env.compressedKlasses
+                        ? env.narrowKlassBase + ((uint64_t)*kid << env.narrowKlassShift)
+                        : *kid;
+      std::string name;
+      if (auto lh = proc_.read<uint32_t>(k2 + env.offKlassLayoutHelper); lh && *lh) {
+        if (env.offKlassName >= 0) {
+          if (auto sym = proc_.read<uint64_t>(k2 + env.offKlassName); sym && *sym)
+            if (auto n = jvm_.readSymbol(proc_, *sym)) name = *n;
+        }
+        // Fallback when the klass-name path comes up empty: fingerprint the
+        // Minecraft class by its unique LocalPlayer-typed field from the
+        // mapping rules.
+        if (name.empty()) {
+          std::vector<jvm::FieldDesc> mfs;
+          std::string merr;
+          auto playerRule = mapping_.field("player");
+          auto plName = mapping_.className("localPlayer");
+          if (playerRule && plName &&
+              klassReader_.readFields(proc_, jvm_, k2, mfs, &merr)) {
+            std::string pdesc = "L" + *plName + ";";
+            for (auto& f : mfs)
+              if (!f.isStatic && f.name == playerRule->name && f.descriptor == pdesc) {
+                name = *mcName; // fingerprint match
+                break;
+              }
+          }
+        }
+      }
+
+      spdlog::info("mc model: recovery: candidate @ {} (base=0x{:X} shift={}) mark=0x{:X} "
+                   "kid=0x{:X} klass @ {} name='{}' | {}",
+                   util::hex(addr), base, shift, mark ? *mark : 0, *kid, util::hex(k2), name,
+                   heap_.regionSummary(proc_, jvm_, addr));
+      if (name == *mcName) {
+        lastHeap_.targetAddrs[*mcName].push_back(addr);
+        spdlog::info("mc model: singleton '{}' recovered via '{}' back-reference", *mcName,
+                     *grName);
+        return true;
+      }
+    }
+  }
+  spdlog::warn("mc model: recovery via '{}' back-reference found no valid instance",
+               *grName);
+  return false;
+}
+
+// Runs every frame while attached. The full heap scan is slow, so a missing
+// model is first attacked cheaply: re-run recovery + model init (field tables
+// are cached) — that alone covers menu -> world transitions. A fresh scan is
+// only started when the window title moved on (loading finished, world
+// entered) or after a bounded idle period.
+void App::ensureModel() {
+  if (!attached_ || !jvm_.ok() || !lastHeap_.ok) return;
+  if (scanState_.load() != 0) return; // a scan owns lastHeap_ / model_
+  auto mcName = mapping_.className("minecraft");
+  if (!mcName) return;
+
+  auto now = std::chrono::steady_clock::now();
+  bool haveMc = !lastHeap_.targetAddrs[*mcName].empty();
+
+  if (!haveMc) {
+    if (now - lastRecoverTry_ >= std::chrono::seconds(3)) {
+      lastRecoverTry_ = now;
+      haveMc = recoverMcSingleton();
+    }
+    if (!haveMc) {
+      wchar_t t[256]{};
+      GetWindowTextW(target_.hwnd, t, 256);
+      std::wstring cur(t);
+      bool titleChanged = !cur.empty() && cur != lastScanTitle_;
+      bool idleTooLong = now - lastScanEnd_ > std::chrono::seconds(60);
+      if (autoRescans_ < 5 &&
+          ((titleChanged && now - lastScanEnd_ > std::chrono::seconds(5)) || idleTooLong)) {
+        if (titleChanged)
+          spdlog::info("heap: window title changed ('{}' -> '{}') - rescanning",
+                       util::toUtf8(lastScanTitle_), util::toUtf8(cur));
+        else
+          spdlog::info("heap: target still missing after {} auto-rescans - rescanning",
+                       autoRescans_);
+        ++autoRescans_;
+        startScan();
+      }
+      return;
+    }
+  }
+
+  if (!model_.valid() && now - lastModelTry_ >= std::chrono::seconds(3)) {
+    lastModelTry_ = now;
+    initModelFromScan();
   }
 }
 
@@ -264,6 +470,7 @@ void App::frame() {
   pollScan(); // join finished background scan before touching its results
   espEnabled_ = menuState_.espEnabled;
   fillMenuState();
+  ensureModel(); // cheap recovery / init retry while the model is missing
   rend_.beginFrame();
   if (espEnabled_ && attached_ && model_.valid()) drawEsp();
   if (menuOpen_) menu_.draw(menuState_);
@@ -506,15 +713,19 @@ void App::fillMenuState() {
     st.playerLine = es.error.empty() ? "-" : es.error;
   }
 
-  st.heapOk = heap_.ready() && lastHeap_.ok;
-  st.heapG1 = heap_.g1();
-  st.heapSizeMode = heap_.calibratedMode();
-  st.heapLine = lastHeap_.ok
-                    ? std::format("{} regions, {} objects, {:.1f}s", lastHeap_.regionsScanned,
-                                  lastHeap_.objectsSeen, lastHeap_.seconds)
-                    : (lastHeap_.error.empty() ? "-" : lastHeap_.error);
-  st.mcObjects = lastHeap_.mcObjects;
-  st.targetHits.assign(lastHeap_.targetCounts.begin(), lastHeap_.targetCounts.end());
+  // lastHeap_ is written by the scan thread while scanState_ == 1 — skip the
+  // reads there instead of racing the result assignment.
+  if (scanState_.load() != 1) {
+    st.heapOk = heap_.ready() && lastHeap_.ok;
+    st.heapG1 = heap_.g1();
+    st.heapSizeMode = heap_.calibratedMode();
+    st.heapLine = lastHeap_.ok
+                      ? std::format("{} regions, {} objects, {:.1f}s", lastHeap_.regionsScanned,
+                                    lastHeap_.objectsSeen, lastHeap_.seconds)
+                      : (lastHeap_.error.empty() ? "-" : lastHeap_.error);
+    st.mcObjects = lastHeap_.mcObjects;
+    st.targetHits.assign(lastHeap_.targetCounts.begin(), lastHeap_.targetCounts.end());
+  }
   st.onRescan = [this]() { startScan(); };
   st.onDump = [this]() {
     for (const char* f : {"G1CollectedHeap", "HeapRegion", "GrowableArray", "CollectedHeap",

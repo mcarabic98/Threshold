@@ -33,6 +33,9 @@ private:
   void startScan(); // background heap scan + model init
   void pollScan();  // join finished scan thread
   void dumpMcFields();
+  bool recoverMcSingleton(); // splice missed singleton via back-references
+  bool initModelFromScan();  // mc instance -> klass -> GameModel init
+  void ensureModel();        // cheap per-frame retry while the model is invalid
 
   // game state
   mem::Process proc_;
@@ -49,6 +52,11 @@ private:
   bool menuOpen_ = false;
   bool quit_ = false;
   std::chrono::steady_clock::time_point lastScan_{};
+  std::chrono::steady_clock::time_point lastScanEnd_{};
+  std::chrono::steady_clock::time_point lastModelTry_{};
+  std::chrono::steady_clock::time_point lastRecoverTry_{};
+  std::wstring lastScanTitle_;
+  int autoRescans_ = 0; // bounded auto rescans since the last model init
 
   // background scan
   std::thread scanThread_;

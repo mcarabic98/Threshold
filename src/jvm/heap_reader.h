@@ -41,6 +41,12 @@ public:
                       const std::vector<std::string>& targets,
                       std::atomic<bool>* cancel = nullptr);
 
+  // One-shot diagnostic: which listed region holds addr, its HeapRegionType
+  // tag, and whether the walk covers that tag. Empty list / error reported
+  // as text. Used when a target class unexpectedly has zero instances.
+  std::string regionSummary(const mem::Process& p, const JvmRuntime& rt,
+                            uint64_t addr) const;
+
 private:
   struct KlassInfo {
     bool valid = false;
@@ -82,6 +88,10 @@ private:
     size_t size() const { return bottoms.size(); }
   };
   RegionList collectRegions(const mem::Process& p, const JvmRuntime& rt) const;
+  // CollectedHeap::_reserved as [start, end). JDK 21 dropped MemRegion from
+  // VMStructs, so the raw {_start, _byte_size|_end} pair is parsed directly.
+  std::optional<std::pair<uint64_t, uint64_t>> reservedRange(const mem::Process& p,
+                                                             const JvmRuntime& rt) const;
   std::map<uint64_t, size_t> sampleKlassIds(const mem::Process& p, const RegionList& rl,
                                             int maxRegions) const;
 

@@ -495,14 +495,15 @@ void JvmRuntime::buildEnv(const mem::Process& proc) {
     return false;
   };
 
-  // Heap data oops: always treat as compressed in this build (heaps under
-  // 32 GB; zero-based encoding also yields base 0 / shift 0). Newer JDKs pack
-  // the values as nested "Universe::_narrow_oop._base".
-  bool oopBase = getStaticU64("Universe", "_narrow_oop_base", e.narrowOopBase) ||
-                 getStaticU64("Universe", "_narrow_oop._base", e.narrowOopBase);
-  bool oopShift = getStaticInt("Universe", "_narrow_oop_shift", e.narrowOopShift) ||
-                  getStaticInt("Universe", "_narrow_oop._shift", e.narrowOopShift);
-  e.compressedOops = oopBase && oopShift;
+  // Heap data oops: compressed unless explicitly disabled — JDK 21+ dropped
+  // the Universe::_narrow_oop_* statics entirely, so missing statics must not
+  // flip the flag. base/shift stay best-effort: when absent (0/0), the model
+  // derives the real decode from hypotheses over live objects.
+  getStaticU64("Universe", "_narrow_oop_base", e.narrowOopBase) ||
+      getStaticU64("Universe", "_narrow_oop._base", e.narrowOopBase);
+  getStaticInt("Universe", "_narrow_oop_shift", e.narrowOopShift) ||
+      getStaticInt("Universe", "_narrow_oop._shift", e.narrowOopShift);
+  e.compressedOops = true;
 
   // Compressed class pointers: flat names on JDK <= 16, nested
   // "Universe::_narrow_klass._*" on 17-20, CompressedKlassPointers on 21+.
