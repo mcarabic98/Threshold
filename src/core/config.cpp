@@ -23,6 +23,7 @@ bool load(Config& out) {
       out.menuKey = v->get<int>();
     if (auto v = j.find("exitKey"); v != j.end() && v->is_number_integer())
       out.exitKey = v->get<int>();
+    if (auto v = j.find("modules"); v != j.end() && v->is_object()) out.modules = *v;
     return true;
   } catch (const std::exception& e) {
     spdlog::warn("config parse failed: {}", e.what());
@@ -34,6 +35,7 @@ bool save(const Config& cfg) {
   nlohmann::json j;
   j["menuKey"] = cfg.menuKey;
   j["exitKey"] = cfg.exitKey;
+  if (!cfg.modules.empty()) j["modules"] = cfg.modules;
   std::ofstream f(appDir() / L"config.json");
   if (!f) return false;
   f << j.dump(2) << "\n";

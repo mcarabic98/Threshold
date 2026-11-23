@@ -13,6 +13,7 @@
 #include "mc/game_model.h"
 #include "mc/mappings.h"
 #include "memory/process.h"
+#include "modules/module.h"
 #include "overlay/overlay_window.h"
 #include "overlay/renderer.h"
 #include "ui/menu.h"
@@ -36,6 +37,8 @@ private:
   bool recoverMcSingleton(); // splice missed singleton via back-references
   bool initModelFromScan();  // mc instance -> klass -> GameModel init
   void ensureModel();        // cheap per-frame retry while the model is invalid
+  void buildRegistry();      // register the module set once per run
+  void syncConfig(bool force); // debounced save of module state to config.json
 
   // game state
   mem::Process proc_;
@@ -63,18 +66,16 @@ private:
   std::atomic<int> scanState_{0}; // 0 idle, 1 running, 2 finished
   std::atomic<bool> scanCancel_{false};
 
-  // overlay
+  // overlay + modules
   overlay::OverlayWindow win_;
   overlay::Renderer rend_;
   ui::Menu menu_;
   ui::MenuState menuState_;
-  bool espEnabled_ = true;
-  std::chrono::steady_clock::time_point lastPosChange_{};
-  mc::EntitySnapshot lastPlayer_{};
-  bool hasLastPlayer_ = false;
-  std::chrono::steady_clock::time_point lastFovRead_{};
-  float cachedFov_ = 70.f;
-  void drawEsp();
+  mods::ModuleRegistry mods_;
+  config::Config cfg_;
+  uint64_t savedCfgVersion_ = 0; // mods_.changeVersion() of the last save
+  mc::EntitySnapshot lastPs_{};
+  bool lastPsValid_ = false;
 };
 
 } // namespace app

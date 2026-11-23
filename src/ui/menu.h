@@ -4,29 +4,11 @@
 #include <string>
 #include <vector>
 
-#include "jvm/heap_reader.h"
-#include "jvm/jvm_runtime.h"
-#include "mc/game_model.h"
-#include "mc/mappings.h"
-#include "memory/process.h"
+#include "modules/module.h"
 
 namespace ui {
 
 extern ImFont* g_iconFont; // Segoe MDL2 Assets, set by the renderer
-
-// Metro-style module definition (tile in the grid).
-struct ModuleDef {
-  std::string id;
-  std::string name;
-  unsigned iconGlyph; // Segoe MDL2 Assets codepoint
-  ImU32 color;
-  std::string category;
-  std::string desc;
-  bool enabled = false;
-  bool wide = false;
-  std::string key;
-  std::string live;
-};
 
 struct MenuState {
   bool attached = false;
@@ -53,43 +35,37 @@ struct MenuState {
   bool playerValid = false;
   std::string playerLine;
 
-  // esp
-  bool espEnabled = true;
-  size_t espEntities = 0;
-  std::string espError;
-  float espFov = 70.f;
-  bool espFovOverridden = false;
-  float espDistance = 128.f;
-  bool espShowMobs = true;
-  bool espShowPlayers = true;
-  bool espShowItems = false;
-  bool espShowMisc = false;
-  float espBoxOpacity = 100.f;
-
   std::function<void()> onRescan;
   std::function<void()> onDump;
   std::function<void()> onDumpFields;
 };
 
+// Metro menu driven by the module registry: tiles come from the registry,
+// the right panel renders each module's settings by type.
 class Menu {
 public:
-  void draw(MenuState& st);
+  void draw(MenuState& st, mods::ModuleRegistry& reg);
   ImFont* iconFont = nullptr; // Segoe MDL2 Assets, set by renderer
 
 private:
   void drawHeader(MenuState& st);
   void drawNav(MenuState& st);
-  void drawGrid(MenuState& st);
+  void drawGrid();
   void drawPanel(MenuState& st);
-  void drawTile(ModuleDef& m, ImVec2 pos, ImVec2 size, bool selected);
-  void drawSwitch(ImVec2 pos, bool on);
+  void drawTile(mods::Module& m, ImVec2 pos, ImVec2 size, bool selected);
   void drawToggleRow(const char* label, bool* val, float tx, float* y);
   void drawSliderRow(const char* label, float* val, float mn, float mx, const char* fmt,
                      float tx, float* y, float cw);
-  void drawTextRow(const char* label, const char* val, float tx, float* y);
+  void drawEnumRow(mods::Setting& s, float tx, float* y, float cw);
+  void drawKeyRow(mods::Setting& s, float tx, float* y, float cw);
+  void pollKeyCapture(); // bind capture by async key scan: works without focus
+
+  mods::ModuleRegistry* reg_ = nullptr; // set in draw(); edits mark it dirty
   std::string selModuleId_ = "esp";
   std::string selCategory_ = "Все";
-  bool listenKey_ = false;
+  mods::Setting* listenTarget_ = nullptr; // setting being rebound, null = idle
+  bool keySnap_[256] = {};                // key-down state at capture start
+  int lastDrawFrame_ = -2;                // ImGui frame of the previous draw()
 };
 
 } // namespace ui

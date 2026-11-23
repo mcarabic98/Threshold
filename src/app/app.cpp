@@ -3,15 +3,17 @@
 #include <spdlog/spdlog.h>
 #include <imgui_impl_win32.h>
 
-#include <cmath>
-#include <cstring>
 #include <format>
+#include <memory>
 #include <set>
 #include <thread>
 
 #include <imgui.h>
 
 #include "core/util.h"
+#include "modules/esp.h"
+#include "modules/hud.h"
+#include "ui/theme.h"
 
 // Declared under '#if 0' in imgui_impl_win32.h by design — forward-declare here.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg,
@@ -25,6 +27,10 @@ constexpr int HK_QUIT = 2;
 }
 
 int App::run(const config::Config& cfg) {
+  cfg_ = cfg;
+  buildRegistry();
+  mods_.applyJson(cfg_.modules); // restore enabled state + settings + binds
+
   // Fabric intermediary names (1.21.x); MCP/Forge names come later via mappings.
   targets_ = {
       "net/minecraft/class_310",  // Minecraft / MinecraftClient
@@ -98,6 +104,7 @@ int App::run(const config::Config& cfg) {
   }
 
   detach();
+  syncConfig(true); // flush pending module edits on the way out
   UnregisterHotKey(win_.hwnd(), HK_MENU);
   UnregisterHotKey(win_.hwnd(), HK_QUIT);
   rend_.shutdown();
@@ -468,200 +475,60 @@ void App::pollTarget() {
 
 void App::frame() {
   pollScan(); // join finished background scan before touching its results
-  espEnabled_ = menuState_.espEnabled;
   fillMenuState();
   ensureModel(); // cheap recovery / init retry while the model is missing
-  rend_.beginFrame();
-  if (espEnabled_ && attached_ && model_.valid()) drawEsp();
-  if (menuOpen_) menu_.draw(menuState_);
-  rend_.endFrame();
-}
 
-// Project world -> screen with a view-projection matrix built from the
-// camera basis (position + forwards/up/left) and a vertical FOV of 70 deg.
-static bool projectPoint(const float view[16], const float proj[16], double x, double y,
-                         double z, int w, int h, ImVec2* out) {
-  // view transform
-  double vx = view[0] * x + view[4] * y + view[8] * z + view[12];
-  double vy = view[1] * x + view[5] * y + view[9] * z + view[13];
-  double vz = view[2] * x + view[6] * y + view[10] * z + view[14];
-  double vw = view[3] * x + view[7] * y + view[11] * z + view[15];
-  // projection
-  double px = proj[0] * vx + proj[4] * vy + proj[8] * vz + proj[12] * vw;
-  double py = proj[1] * vx + proj[5] * vy + proj[9] * vz + proj[13] * vw;
-  double pw = proj[3] * vx + proj[7] * vy + proj[11] * vz + proj[15] * vw;
-  if (pw <= 0.001) return false;
-  out->x = (float)((px / pw * 0.5 + 0.5) * w);
-  out->y = (float)((1.0 - (py / pw * 0.5 + 0.5)) * h);
-  return true;
-}
-
-void App::drawEsp() {
-  mc::CameraSnapshot cam;
-  if (!model_.readCamera(proc_, cam) || !cam.valid) {
-    menuState_.espError = "camera read failed";
-    return;
-  }
-  std::vector<mc::EspEntity> ents;
-  if (!model_.readEntities(proc_, ents)) {
-    menuState_.espError = "entity list read failed";
-    return;
-  }
-  menuState_.espError.clear();
-  menuState_.espEntities = ents.size();
-
-  // apply category + distance filters from the menu
-  ents.erase(std::remove_if(ents.begin(), ents.end(),
-                            [&](const mc::EspEntity& e) {
-                              double mx = (e.bbMin[0] + e.bbMax[0]) * 0.5;
-                              double my = (e.bbMin[1] + e.bbMax[1]) * 0.5;
-                              double mz = (e.bbMin[2] + e.bbMax[2]) * 0.5;
-                              double ddx = mx - cam.pos[0], ddy = my - cam.pos[1],
-                                     ddz = mz - cam.pos[2];
-                              double dst = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
-                              if (dst > menuState_.espDistance) return true;
-                              if (e.self) return false; // self always shown
-                              switch (e.category) {
-                                case (int)mc::EntCat::Mob:
-                                  return !menuState_.espShowMobs;
-                                case (int)mc::EntCat::Player:
-                                  return !menuState_.espShowPlayers;
-                                case (int)mc::EntCat::Item:
-                                  return !menuState_.espShowItems;
-                                default:
-                                  return !menuState_.espShowMisc;
-                              }
-                            }),
-            ents.end());
-  menuState_.espEntities = ents.size();
-
-  ImVec2 winPos, winSize;
-  {
+  // module context: one snapshot of everything a module may read this frame
+  mods::ModuleContext ctx;
+  ctx.proc = &proc_;
+  ctx.model = &model_;
+  ctx.attached = attached_;
+  ctx.modelValid = attached_ && model_.valid();
+  ctx.dt = ImGui::GetIO().DeltaTime;
+  ctx.playerValid = lastPsValid_;
+  ctx.player = lastPs_;
+  if (attached_) {
     RECT rc = {};
-    GetClientRect(target_.hwnd, &rc);
     POINT tl = {0, 0};
-    ClientToScreen(target_.hwnd, &tl);
-    winPos = ImVec2((float)tl.x, (float)tl.y);
-    winSize = ImVec2((float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
-  }
-  int w = (int)winSize.x, h = (int)winSize.y;
-  if (w <= 0 || h <= 0) return;
-
-  // view matrix rows: right = -left, up, -forward (right-handed, -Z forward)
-  float r[3] = {-cam.left[0], -cam.left[1], -cam.left[2]};
-  float u[3] = {cam.up[0], cam.up[1], cam.up[2]};
-  float f[3] = {cam.forwards[0], cam.forwards[1], cam.forwards[2]};
-  float view[16] = {
-      r[0],        u[0],        -f[0],        0.f,
-      r[1],        u[1],        -f[1],        0.f,
-      r[2],        u[2],        -f[2],        0.f,
-      0.f,         0.f,         0.f,          1.f,
-  };
-  float px = 0, py = 0, pz = 0;
-  // translation column: -R * pos
-  px = -(r[0] * cam.pos[0] + r[1] * cam.pos[1] + r[2] * cam.pos[2]);
-  py = -(u[0] * cam.pos[0] + u[1] * cam.pos[1] + u[2] * cam.pos[2]);
-  pz = (f[0] * cam.pos[0] + f[1] * cam.pos[1] + f[2] * cam.pos[2]);
-  view[12] = px;
-  view[13] = py;
-  view[14] = pz;
-
-  // re-read the game FOV every 5 seconds: file first, then heap chain
-  auto nowFov = std::chrono::steady_clock::now();
-  if (!menuState_.espFovOverridden &&
-      std::chrono::duration<double>(nowFov - lastFovRead_).count() > 5.0) {
-    lastFovRead_ = nowFov;
-    cachedFov_ = model_.readFovFromFile(proc_);
-    if (cachedFov_ <= 70.1f && cachedFov_ >= 69.9f) cachedFov_ = model_.readFov(proc_);
-  }
-  float fovDeg = menuState_.espFovOverridden ? menuState_.espFov : cachedFov_;
-  menuState_.espFov = fovDeg; // show the effective value in the menu
-  float fovY = fovDeg * 3.14159265f / 180.f;
-  float aspect = (float)w / (float)h;
-  float tz = 1.f / std::tan(fovY * 0.5f);
-  float farZ = 1000.f, nearZ = 0.05f;
-  float proj[16] = {0};
-  proj[0] = tz / aspect;
-  proj[5] = tz;
-  proj[10] = farZ / (nearZ - farZ);
-  proj[11] = -1.f;
-  proj[14] = nearZ * farZ / (nearZ - farZ);
-
-  ImDrawList* dl = ImGui::GetForegroundDrawList();
-  ImU32 colorTxt = IM_COL32(255, 255, 255, 230);
-
-  // category colors
-  static const ImU32 catColors[(int)mc::EntCat::Count] = {
-      IM_COL32(255, 60, 60, 230),   // Mob      — red
-      IM_COL32(60, 130, 255, 230),  // Player   — blue
-      IM_COL32(180, 180, 180, 200), // ArmorStand — gray
-      IM_COL32(255, 150, 40, 210),  // Projectile — orange
-      IM_COL32(255, 220, 60, 210),  // Item     — yellow
-      IM_COL32(60, 255, 120, 210),  // Living   — green
-      IM_COL32(220, 220, 220, 190), // Misc     — white
-  };
-  static const char* catNames[(int)mc::EntCat::Count] = {"Mob", "Player", "ArmorStand",
-                                                         "Projectile", "Item", "Living",
-                                                         "Other"};
-
-  // tick-rate interpolation: MC entities update positions at 20 tps; the
-  // renderer interpolates with partialTicks. Track the player position change
-  // to estimate the tick phase, then extrapolate every entity the same way.
-  auto now = std::chrono::steady_clock::now();
-  mc::EntitySnapshot ps;
-  if (model_.readPlayer(proc_, ps) && ps.valid) {
-    if (hasLastPlayer_ &&
-        (std::abs(ps.x - lastPlayer_.x) > 1e-9 || std::abs(ps.y - lastPlayer_.y) > 1e-9 ||
-         std::abs(ps.z - lastPlayer_.z) > 1e-9))
-      lastPosChange_ = now;
-    lastPlayer_ = ps;
-    hasLastPlayer_ = true;
-  }
-  double partial = std::chrono::duration<double>(now - lastPosChange_).count() / 0.05;
-  partial = std::clamp(partial, 0.0, 1.15);
-
-  double cx2 = cam.pos[0], cy2 = cam.pos[1], cz2 = cam.pos[2];
-  for (auto& e : ents) {
-    // extrapolate: cur + (cur - prev) * partialTick
-    double dx = (e.cur[0] - e.prev[0]) * partial;
-    double dy = (e.cur[1] - e.prev[1]) * partial;
-    double dz = (e.cur[2] - e.prev[2]) * partial;
-    // project the 8 AABB corners, shifted by the extrapolation delta
-    ImVec2 minS(1e9f, 1e9f), maxS(-1e9f, -1e9f);
-    int okCount = 0;
-    for (int c = 0; c < 8; ++c) {
-      double cx = ((c & 1) ? e.bbMax[0] : e.bbMin[0]) + dx;
-      double cy = ((c & 2) ? e.bbMax[1] : e.bbMin[1]) + dy;
-      double cz = ((c & 4) ? e.bbMax[2] : e.bbMin[2]) + dz;
-      ImVec2 s;
-      if (projectPoint(view, proj, cx, cy, cz, w, h, &s)) {
-        ++okCount;
-        minS.x = std::min(minS.x, s.x);
-        minS.y = std::min(minS.y, s.y);
-        maxS.x = std::max(maxS.x, s.x);
-        maxS.y = std::max(maxS.y, s.y);
-      }
+    if (GetClientRect(target_.hwnd, &rc) && ClientToScreen(target_.hwnd, &tl)) {
+      ctx.winPos = ImVec2((float)tl.x, (float)tl.y);
+      ctx.winSize = ImVec2((float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
     }
-    if (okCount < 8) continue; // fully or partially behind the camera
-    if (maxS.x - minS.x < 2 || maxS.y - minS.y < 2) continue;
-
-    ImU32 color = e.self ? IM_COL32(255, 255, 255, 200) : catColors[e.category & 7];
-    dl->AddRect(ImVec2(winPos.x + minS.x, winPos.y + minS.y),
-                ImVec2(winPos.x + maxS.x, winPos.y + maxS.y), color, 0.f, 0, 1.5f);
-
-    // center for distance
-    double mx = ((e.bbMin[0] + e.bbMax[0]) * 0.5) + dx;
-    double my = ((e.bbMin[1] + e.bbMax[1]) * 0.5) + dy;
-    double mz = ((e.bbMin[2] + e.bbMax[2]) * 0.5) + dz;
-    double dist = std::sqrt((mx - cx2) * (mx - cx2) + (my - cy2) * (my - cy2) +
-                            (mz - cz2) * (mz - cz2));
-
-    const char* cls = e.className.c_str();
-    if (const char* slash = std::strrchr(cls, '/')) cls = slash + 1;
-    auto label = std::format("[{}] {} {:.0f}m", e.self ? "You" : catNames[e.category & 7],
-                             e.self ? "" : cls, dist);
-    dl->AddText(ImVec2(winPos.x + minS.x, winPos.y + minS.y - 14.f), colorTxt, label.c_str());
   }
+
+  rend_.beginFrame();
+  mods_.updateEnabled(ctx); // inside the frame: render modules draw here
+  if (menuOpen_) menu_.draw(menuState_, mods_);
+  rend_.endFrame();
+
+  syncConfig(false); // debounced: only writes once edits settle
+}
+
+void App::buildRegistry() {
+  using mods::Module;
+  mods_.add(std::make_unique<mods::EspModule>());
+  mods_.add(std::make_unique<Module>("aim", "Aimbot", 0xE7B3, ui::C_GREEN, "Combat",
+                                     "Плавное наведение на ближайшую цель.", false, false, 'R'));
+  mods_.add(std::make_unique<Module>("hitbox", "Хитбоксы", 0xE7A8, ui::C_TEAL, "Combat",
+                                     "Показ хитбоксов существ в мире.", false, false, VK_F3));
+  mods_.add(std::make_unique<Module>("bright", "Яркость", 0xE706, ui::C_YELLOW, "Визуал",
+                                     "Полная яркость в тёмных местах.", false, false, 'B'));
+  mods_.add(std::make_unique<Module>("zoom", "Зум", 0xE721, ui::C_BLUE, "Визуал",
+                                     "Приближение камеры по клавише.", false, false, 'C'));
+  mods_.add(std::make_unique<mods::FpsModule>());
+  mods_.add(std::make_unique<mods::CoordsModule>());
+  mods_.add(std::make_unique<Module>("keys", "Клавиши", 0xE765, ui::C_DARKRED, "HUD",
+                                     "Нажатия WASD и мыши.", false, false));
+  mods_.add(std::make_unique<Module>("ping", "Пинг", 0xE8BD, ui::C_TEAL, "HUD",
+                                     "Задержка до сервера.", false, false));
+}
+
+void App::syncConfig(bool force) {
+  if (mods_.changeVersion() == savedCfgVersion_) return; // nothing to save
+  if (!force && std::chrono::steady_clock::now() - mods_.lastChange() < std::chrono::seconds(2))
+    return; // wait for the user to stop dragging
+  cfg_.modules = mods_.toJson();
+  if (config::save(cfg_)) savedCfgVersion_ = mods_.changeVersion();
 }
 
 void App::fillMenuState() {
@@ -702,13 +569,16 @@ void App::fillMenuState() {
   addStatic("Universe", "_narrow_oop_base");
 
   // heap
-  // player
+  // player (also feeds the module context this frame)
   mc::EntitySnapshot es;
   if (attached_ && model_.valid() && model_.readPlayer(proc_, es) && es.valid) {
+    lastPs_ = es;
+    lastPsValid_ = true;
     st.playerValid = true;
     st.playerLine = std::format("x {:.2f}  y {:.2f}  z {:.2f}   yaw {:.1f}  pitch {:.1f}", es.x,
                                 es.y, es.z, es.yaw, es.pitch);
   } else {
+    lastPsValid_ = false;
     st.playerValid = attached_ && model_.valid();
     st.playerLine = es.error.empty() ? "-" : es.error;
   }

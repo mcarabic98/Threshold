@@ -43,6 +43,12 @@
   найденные таргет-классы с количеством инстансов, координаты игрока.
 - Кнопки Rescan / Dump / Dump Fields для диагностики прямо из меню.
 
+### Модули
+- Каждый модуль — класс с `update(ctx)` и набором настроек (toggle / slider /
+  enum / keybind); плитки и панель настроек меню рендерит из реестра.
+- Состояние модулей (включённость, настройки, бинды) пишется в `config.json`
+  (отложенно после правок и при выходе) и восстанавливается при старте.
+
 ## Как это работает
 
 ```
@@ -169,7 +175,9 @@ src/
               навигация по объектам игры, сущности, камера, FOV; маппинги
   overlay/    layered-окно, D3D11 + DirectComposition, ImGui-рендер
   ui/         Metro-меню (тайлы, категории, панель настроек)
-  app/        оркестрация: attach, фоновый скан, рескан-политика, ESP
+  modules/    каркас модулей: реестр, настройки (toggle/slider/enum/keybind),
+              сериализация состояния; ESP и HUD-модули
+  app/        оркестрация: attach, фоновый скан, рескан-политика, кадр модулей
 mappings/     JSON-таблицы классов/полей по версиям игры
 ```
 
@@ -183,6 +191,17 @@ mappings/     JSON-таблицы классов/полей по версиям 
   `G1HeapRegionTable` (`_base @16` → `HeapRegion*[]`, `_length @24`);
   `HeapRegion::_bottom/_top` @ 0/16. `GrowableArray<T>::_data` описан на
   инстанциации (`GrowableArray<int>`), `_len` — на `GrowableArrayBase`.
+- `G1CollectedHeap::_hrm`: в JDK ≤ 20 и ранних сборках 21 — это
+  `HeapRegionManager*`, в обновлённых (проверено на Microsoft OpenJDK 21.0.3)
+  — сам объект по значению. Qword по этому смещению тогда — `_bot_mapper`, и
+  разыменование уводит в массив карточной таблицы (`0 usable regions`).
+  Перебираются обе раскладки, побеждает та, чья таблица даёт валидные
+  `HeapRegion`.
+- `G1HeapRegionTable` — `G1BiasedMappedArray<HeapRegion*>`: `_base @16`,
+  `_length @24`, `_biased_base @32`, `_bias @40`, `_shift_by @48`
+  (= log2 размера региона); запись региона `i` лежит в `_base[i]`.
+- `MemRegion { _start, _word_size }`: размер в **HeapWords** (×8), а не в
+  байтах — для кучи 8 ГБ поле равно `0x40000000`.
 - Имена констант: `_lh_array_tag_oop_value` → `_lh_array_tag_obj_value`;
   layout helper хранит header size в битах 16–23, element type в 8–15.
 - Сжатые klass-указатели: CDS-регион на Windows маппится на `0x8_00000000`,
@@ -200,8 +219,10 @@ mappings/     JSON-таблицы классов/полей по версиям 
   fieldflags Optionals`); опционалы — по битам fieldflags; офсеты полей в
   байтах. Источник формата: `oops/fieldInfo.hpp`, `utilities/unsigned5.hpp`
   (OpenJDK 21).
-- Куча маппится на `0x6_00000000..0x640000000` (1 ГБ); первый регион —
-  CDS-архив (ZIP-данные), в сэмплинге участвуют только eden/survivor/old.
+- Куча маппится с `0x6_00000000`; зарезервированный размер =
+  `_word_size` × 8 (при `-Xmx8G` — до `0x8_00000000`, закоммичено `-Xms`).
+  Первый регион — CDS-архив (ZIP-данные), в сэмплинге участвуют только
+  eden/survivor/old.
 
 ## Ограничения
 

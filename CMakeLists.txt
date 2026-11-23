@@ -23,6 +23,9 @@ add_executable(threshold
   src/mc/finder.cpp
   src/mc/game_model.cpp
   src/mc/mappings.cpp
+  src/modules/module.cpp
+  src/modules/esp.cpp
+  src/modules/hud.cpp
   src/overlay/overlay_window.cpp
   src/overlay/renderer.cpp
   src/ui/menu.cpp

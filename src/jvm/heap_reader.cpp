@@ -116,12 +116,35 @@ HeapReader::RegionList HeapReader::collectRegions(const mem::Process& p,
     rl.error = "no G1 walk";
     return rl;
   }
-  auto hrm = p.read<uint64_t>((uintptr_t)(collectedHeap_ + offG1Hrm_));
-  if (!hrm || !*hrm) {
-    rl.error = "HeapRegionManager unreadable";
-    return rl;
+  // JDK 21 update builds embed HeapRegionManager inside G1CollectedHeap
+  // (_hrm holds the object itself; the qword there is its first member, the
+  // _bot_mapper pointer); JDK <= 20 and early 21 store a HeapRegionManager*
+  // in the same field. Try both layouts and let the table contents decide —
+  // the wrong structure yields no usable region set.
+  std::vector<uint64_t> hrms{collectedHeap_ + (uint64_t)offG1Hrm_};
+  if (auto ptr = p.read<uint64_t>((uintptr_t)(collectedHeap_ + (uint64_t)offG1Hrm_)))
+    if (*ptr > 0x10000 && *ptr < 0x7FFFFFFFFFFFull && *ptr != hrms.front())
+      hrms.push_back(*ptr);
+
+  RegionList best;
+  for (size_t i = 0; i < hrms.size(); ++i) {
+    RegionList rl = collectRegionsHrm(hrms[i], p, rt);
+    if (rl.ok && rl.size() >= 2) {
+      if (hrms.size() > 1)
+        spdlog::debug("heap: region layout candidate #{} (hrm {}) accepted, {} regions", i,
+                      util::hex(hrms[i]), rl.size());
+      return rl;
+    }
+    if (!best.ok || rl.size() > best.size()) best = std::move(rl);
   }
-  uint64_t regionsBase = *hrm + (uint64_t)offHrmRegions_;
+  if (!best.ok && best.error.empty()) best.error = "no usable region table";
+  return best;
+}
+
+HeapReader::RegionList HeapReader::collectRegionsHrm(uint64_t hrm, const mem::Process& p,
+                                                     const JvmRuntime& rt) const {
+  RegionList rl;
+  uint64_t regionsBase = hrm + (uint64_t)offHrmRegions_;
 
   // JDK <= 20: _regions is a GrowableArray (len @GrowableArrayBase._len,
   // data @GrowableArray<T>::_data). JDK 21+: it is a G1HeapRegionTable
@@ -150,7 +173,7 @@ HeapReader::RegionList HeapReader::collectRegions(const mem::Process& p,
 
   if (!rlDumped_) {
     rlDumped_ = true;
-    spdlog::debug("heap: hrm={} regionsBase={} data={} len={}", util::hex(*hrm),
+    spdlog::debug("heap: hrm={} regionsBase={} data={} len={}", util::hex(hrm),
                   util::hex(regionsBase), util::hex(dataP), len);
   }
   if (!dataP || len <= 0 || len > (1 << 22)) {
@@ -205,19 +228,24 @@ std::optional<std::pair<uint64_t, uint64_t>> HeapReader::reservedRange(
   if (!collectedHeap_) return std::nullopt;
   auto res = rt.structs().field("CollectedHeap", "_reserved");
   if (!res) return std::nullopt;
-  // MemRegion {_start, _byte_size} (JDK 21+) or {_start, _end} (older).
+  // JDK 21 VMStructs publishes MemRegion::_word_size — the size in HeapWords
+  // (8 bytes each on x64), not bytes; JDK <= 20 exposed no MemRegion fields at
+  // all. Decide by the published name, fall back to shape heuristics.
   auto v0 = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res));
   auto v1 = p.read<uint64_t>((uintptr_t)(collectedHeap_ + *res + 8));
   if (!v0 || !v1 || !*v0) return std::nullopt;
   uint64_t lo = 0, hi = 0;
-  if (*v1 > (1u << 20) && *v1 < (1ull << 36) && *v1 % (2u << 20) == 0) {
+  if (rt.structs().field("MemRegion", "_word_size").has_value()) {
+    lo = *v0;
+    hi = lo + *v1 * 8; // HeapWord = 8 bytes (x64-only targets)
+  } else if (*v1 > (1u << 20) && *v1 < (1ull << 36) && *v1 % (2u << 20) == 0) {
     lo = *v0;
     hi = *v0 + *v1;
   } else if (*v1 > *v0) {
     lo = *v0;
     hi = *v1;
   }
-  if (!lo || hi <= lo) return std::nullopt;
+  if (!lo || hi <= lo || hi - lo > (1ull << 36)) return std::nullopt;
   return std::make_pair(lo, hi);
 }
 

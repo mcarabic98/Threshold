@@ -3,8 +3,10 @@
 #include <imgui.h>
 
 #include <algorithm>
-#include <cstring>
-#include <format>
+#include <string>
+#include <windows.h>
+
+#include "ui/theme.h"
 
 static ImVec2 operator+(const ImVec2& a, const ImVec2& b) {
   return ImVec2(a.x + b.x, a.y + b.y);
@@ -17,24 +19,6 @@ namespace ui {
 
 ImFont* g_iconFont = nullptr;
 
-// ---- Metro palette ----
-static constexpr ImU32 C_BG = IM_COL32(0x0e, 0x11, 0x16, 255);
-static constexpr ImU32 C_PANEL = IM_COL32(0x16, 0x1b, 0x22, 255);
-static constexpr ImU32 C_TILE = IM_COL32(0x25, 0x2c, 0x36, 255);
-static constexpr ImU32 C_TILE_HOVER = IM_COL32(0x2d, 0x35, 0x41, 255);
-static constexpr ImU32 C_TEXT = IM_COL32(255, 255, 255, 255);
-static constexpr ImU32 C_DIM = IM_COL32(0x8b, 0x95, 0xa3, 255);
-static constexpr ImU32 C_ACCENT = IM_COL32(0x00, 0xa4, 0xef, 255);
-
-// tile accent colors (Metro palette)
-static constexpr ImU32 C_BLUE = IM_COL32(0x00, 0xa4, 0xef, 255);
-static constexpr ImU32 C_GREEN = IM_COL32(0x7f, 0xba, 0x00, 255);
-static constexpr ImU32 C_RED = IM_COL32(0xf2, 0x50, 0x22, 255);
-static constexpr ImU32 C_YELLOW = IM_COL32(0xff, 0xb9, 0x00, 255);
-static constexpr ImU32 C_PURPLE = IM_COL32(0x8e, 0x44, 0xad, 255);
-static constexpr ImU32 C_TEAL = IM_COL32(0x00, 0xab, 0xa9, 255);
-static constexpr ImU32 C_DARKRED = IM_COL32(0xe5, 0x14, 0x00, 255);
-
 // layout
 static constexpr float NAV_W = 140.f;
 static constexpr float PANEL_W = 230.f;
@@ -42,27 +26,6 @@ static constexpr float HEADER_H = 56.f;
 static constexpr float TILE = 94.f;
 static constexpr float GAP = 6.f;
 static constexpr float PAD = 12.f;
-
-// modules (local layout, shadows header ModuleDef which is unused here)
-
-static ModuleDef g_modules[] = {
-    {"esp",     "ESP",       0xE81C, C_RED,    "Combat", "Подсветка сущностей: мобы, игроки, предметы. Цвет по типу.", true, false, "—"},
-    {"aim",     "Aimbot",    0xE7B3, C_GREEN,  "Combat", "Плавное наведение на ближайшую цель.", false, false, "R"},
-    {"hitbox",  "Хитбоксы",  0xE7A8, C_TEAL,   "Combat", "Показ хитбоксов существ в мире.", false, false, "F3+B"},
-    {"bright",  "Яркость",   0xE706, C_YELLOW, "Визуал", "Полная яркость в тёмных местах.", false, false, "B"},
-    {"zoom",    "Зум",       0xE721, C_BLUE,   "Визуал", "Приближение камеры по клавише.", false, false, "C"},
-    {"fps",     "FPS",       0xE9D9, C_BLUE,   "HUD",    "Частота кадров на экране.", true, true, "—"},
-    {"coords",  "Координаты",0xE7C3, C_PURPLE, "HUD",    "Текущие XYZ и направление.", true, true, "—"},
-    {"keys",    "Клавиши",   0xE765, C_DARKRED,"HUD",    "Нажатия WASD и мыши.", false, false, "—"},
-    {"ping",    "Пинг",      0xE8BD, C_TEAL,   "HUD",    "Задержка до сервера.", false, false, "—"},
-};
-static constexpr int kNumModules = sizeof(g_modules) / sizeof(g_modules[0]);
-
-static ModuleDef* findMod(const char* id) {
-  for (auto& m : g_modules)
-    if (m.id == id) return &m;
-  return nullptr;
-}
 
 static const char* catNames[] = {"Все", "Combat", "Визуал", "HUD", "Настройки"};
 static constexpr int kNumCats = 5;
@@ -92,22 +55,15 @@ static void drawSwImpl(ImDrawList* dl, ImVec2 pos, bool on) {
   dl->AddRectFilled(tp, tp + ImVec2(14, 14), thumb);
 }
 
-static void drawSliderMetro(ImDrawList* dl, ImVec2 pos, float w, float v, float mn, float mx,
-                            ImU32 color) {
-  float frac = (v - mn) / (mx - mn);
-  frac = std::clamp(frac, 0.f, 1.f);
-  float barH = 3.f;
-  float cy = pos.y + 8;
-  dl->AddRectFilled(ImVec2(pos.x, cy - barH / 2), ImVec2(pos.x + w, cy + barH / 2), C_TILE);
-  dl->AddRectFilled(ImVec2(pos.x, cy - barH / 2), ImVec2(pos.x + w * frac, cy + barH / 2), color);
-  dl->AddRectFilled(ImVec2(pos.x + w * frac - 3, cy - 8), ImVec2(pos.x + w * frac + 3, cy + 8),
-                    color);
-}
-
-
 // ---- Menu implementation ----
 
-void Menu::draw(MenuState& st) {
+void Menu::draw(MenuState& st, mods::ModuleRegistry& reg) {
+  reg_ = &reg;
+  // a capture left pending across hidden frames is stale: the menu was closed
+  if (listenTarget_ && ImGui::GetFrameCount() != lastDrawFrame_ + 1) listenTarget_ = nullptr;
+  lastDrawFrame_ = ImGui::GetFrameCount();
+  pollKeyCapture();
+
   ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(760, 480), ImGuiCond_FirstUseEver);
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -127,7 +83,7 @@ void Menu::draw(MenuState& st) {
 
   drawHeader(st);
   drawNav(st);
-  drawGrid(st);
+  drawGrid();
   drawPanel(st);
 
   ImGui::End();
@@ -199,9 +155,9 @@ void Menu::drawNav(MenuState& st) {
   ImGui::Dummy(ImVec2(0, 0));
 }
 
-void Menu::drawTile(ModuleDef& m, ImVec2 pos, ImVec2 size, bool selected) {
+void Menu::drawTile(mods::Module& m, ImVec2 pos, ImVec2 size, bool selected) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  ImU32 bg = m.enabled ? m.color : C_TILE;
+  ImU32 bg = m.enabled ? m.color() : C_TILE;
   ImU32 txtCol = m.enabled ? IM_COL32(255, 255, 255, 255) : C_DIM;
 
   dl->AddRectFilled(pos, pos + size, bg);
@@ -217,10 +173,10 @@ void Menu::drawTile(ModuleDef& m, ImVec2 pos, ImVec2 size, bool selected) {
               m.enabled ? IM_COL32(255, 255, 255, 200) : C_DIM, m.enabled ? "вкл" : "выкл");
 
   // icon (centered-ish)
-  drawIcon(dl, m.iconGlyph, pos + ImVec2(10, size.y * 0.28f), 28.f, txtCol);
+  drawIcon(dl, m.glyph(), pos + ImVec2(10, size.y * 0.28f), 28.f, txtCol);
 
   // name (bottom left)
-  dl->AddText(ImVec2(pos.x + 8, pos.y + size.y - 20), txtCol, m.name.c_str());
+  dl->AddText(ImVec2(pos.x + 8, pos.y + size.y - 20), txtCol, m.name().c_str());
 
   // live counter (bottom right)
   if (m.enabled && !m.live.empty()) {
@@ -231,44 +187,40 @@ void Menu::drawTile(ModuleDef& m, ImVec2 pos, ImVec2 size, bool selected) {
 
   // click handling
   ImGui::SetCursorScreenPos(pos);
-  ImGui::PushID(m.id.c_str());
+  ImGui::PushID(m.id().c_str());
   ImGui::InvisibleButton("##tile", size);
   if (ImGui::IsItemHovered()) dl->AddRectFilled(pos, pos + size, IM_COL32(255, 255, 255, 15));
   if (ImGui::IsItemClicked()) {
-    if (selModuleId_ == m.id) m.enabled = !m.enabled;
-    selModuleId_ = m.id;
+    if (selModuleId_ == m.id()) {
+      m.enabled = !m.enabled;
+      reg_->markChanged();
+    }
+    selModuleId_ = m.id();
   }
   ImGui::PopID();
 }
 
-void Menu::drawGrid(MenuState& st) {
+void Menu::drawGrid() {
   ImVec2 wp = ImGui::GetWindowPos();
   ImVec2 ws = ImGui::GetWindowSize();
   float gx = wp.x + NAV_W;
   float gw = ws.x - NAV_W - PANEL_W;
-
-  // sync ESP live counter
-  if (auto* esp = findMod("esp")) {
-    esp->live = esp->enabled ? std::format("{} ent", st.espEntities) : "";
-  }
 
   float x = gx + PAD;
   float y = wp.y + HEADER_H + PAD;
   float maxX = gx + gw - PAD;
   float maxY = wp.y + ws.y - PAD;
 
-  for (int i = 0; i < kNumModules; ++i) {
-    auto& m = g_modules[i];
-    if (selCategory_[0] != 0 && strcmp(selCategory_.c_str(), "Все") != 0 &&
-        m.category != selCategory_)
-      continue;
-    float tw = m.wide ? TILE * 2 + GAP : TILE;
+  for (auto& pm : reg_->all()) {
+    auto& m = *pm;
+    if (selCategory_ != "Все" && m.category() != selCategory_) continue;
+    float tw = m.wide() ? TILE * 2 + GAP : TILE;
     if (x + tw > maxX) {
       x = gx + PAD;
       y += TILE + GAP;
     }
     if (y + TILE > maxY) break;
-    drawTile(m, ImVec2(x, y), ImVec2(tw, TILE), selModuleId_ == m.id);
+    drawTile(m, ImVec2(x, y), ImVec2(tw, TILE), selModuleId_ == m.id());
     x += tw + GAP;
   }
 
@@ -277,18 +229,16 @@ void Menu::drawGrid(MenuState& st) {
   ImGui::Dummy(ImVec2(gw, 0));
 }
 
-void Menu::drawSwitch(ImVec2 pos, bool on) {
-  ImDrawList* dl = ImGui::GetWindowDrawList();
-  drawSwImpl(dl, pos, on);
-}
-
 void Menu::drawToggleRow(const char* label, bool* val, float tx, float* y) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   ImGui::SetCursorScreenPos(ImVec2(tx, *y));
   ImGui::PushID(label);
   ImGui::InvisibleButton("##tgl", ImVec2(40, 16));
   drawSwImpl(dl, ImVec2(tx, *y), *val);
-  if (ImGui::IsItemClicked()) *val = !*val;
+  if (ImGui::IsItemClicked()) {
+    *val = !*val;
+    reg_->markChanged();
+  }
   ImGui::PopID();
   dl->AddText(ImVec2(tx + 50, *y), C_TEXT, label);
   *y += 24;
@@ -303,16 +253,86 @@ void Menu::drawSliderRow(const char* label, float* val, float mn, float mx, cons
   ImGui::PushItemWidth(cw);
   ImGui::PushID(label);
   ImGui::SliderFloat("##sl", val, mn, mx, fmt);
+  if (ImGui::IsItemDeactivatedAfterEdit()) reg_->markChanged();
   ImGui::PopID();
   ImGui::PopItemWidth();
   *y += 24;
 }
 
-void Menu::drawTextRow(const char* label, const char* val, float tx, float* y) {
+void Menu::drawEnumRow(mods::Setting& s, float tx, float* y, float cw) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
-  dl->AddText(ImVec2(tx, *y), C_DIM, label);
-  dl->AddText(ImVec2(tx + 100, *y), C_TEXT, val);
-  *y += 18;
+  dl->AddText(ImVec2(tx, *y), C_DIM, s.label.c_str());
+  *y += 16;
+
+  // stepper: [<] current option [>], wraps around
+  const char* val = s.options.empty() ? "-" : s.options[s.index];
+  dl->AddRectFilled(ImVec2(tx + 24, *y), ImVec2(tx + cw - 24, *y + 20), C_TILE);
+  ImVec2 ts = ImGui::CalcTextSize(val);
+  dl->AddText(ImVec2(tx + (cw - ts.x) * 0.5f, *y + 3), C_TEXT, val);
+
+  auto arrow = [&](const char* id, const char* glyph, float ax, int delta) {
+    ImGui::SetCursorScreenPos(ImVec2(ax, *y));
+    ImGui::PushID(id);
+    ImGui::InvisibleButton(id, ImVec2(20, 20));
+    bool hover = ImGui::IsItemHovered(), clicked = ImGui::IsItemClicked();
+    ImGui::PopID();
+    dl->AddText(ImVec2(ax + 6, *y + 3), hover ? C_ACCENT : C_DIM, glyph);
+    if (clicked && !s.options.empty()) {
+      int n = (int)s.options.size();
+      s.index = ((s.index + delta) % n + n) % n;
+      reg_->markChanged();
+    }
+  };
+  ImGui::PushID(s.id.c_str());
+  arrow("##l", "<", tx, -1);
+  arrow("##r", ">", tx + cw - 20, +1);
+  ImGui::PopID();
+  *y += 26;
+}
+
+void Menu::drawKeyRow(mods::Setting& s, float tx, float* y, float cw) {
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddText(ImVec2(tx, *y), C_DIM, s.label.c_str());
+  *y += 16;
+
+  bool listening = listenTarget_ == &s;
+  ImVec2 ksz = ImVec2(cw, 26);
+  dl->AddRectFilled(ImVec2(tx, *y), ImVec2(tx, *y) + ksz, C_TILE);
+  if (listening) dl->AddRect(ImVec2(tx, *y), ImVec2(tx, *y) + ksz, C_ACCENT, 0.f, 0, 1.5f);
+  std::string shown = listening ? "Нажмите клавишу… (Esc — отмена)" : mods::vkName(s.vk);
+  dl->AddText(ImVec2(tx + 8, *y + 5), C_TEXT, shown.c_str());
+
+  ImGui::SetCursorScreenPos(ImVec2(tx, *y));
+  ImGui::PushID(s.id.c_str());
+  ImGui::InvisibleButton("##key", ksz);
+  if (ImGui::IsItemClicked()) {
+    if (listening) {
+      listenTarget_ = nullptr; // second click cancels
+    } else {
+      listenTarget_ = &s;
+      // keys held right now (the click itself) must not become the bind
+      for (int k = 0; k < 256; ++k) keySnap_[k] = (GetAsyncKeyState(k) & 0x8000) != 0;
+    }
+  }
+  ImGui::PopID();
+  *y += 32;
+}
+
+void Menu::pollKeyCapture() {
+  if (!listenTarget_) return;
+  for (int k = 1; k < 256; ++k) {
+    bool down = (GetAsyncKeyState(k) & 0x8000) != 0;
+    if (down && !keySnap_[k]) {
+      mods::Setting* s = listenTarget_;
+      listenTarget_ = nullptr;
+      if (k != VK_ESCAPE) { // Esc cancels, any other newly pressed key binds
+        s->vk = k;
+        reg_->markChanged();
+      }
+      return;
+    }
+    keySnap_[k] = down;
+  }
 }
 
 void Menu::drawPanel(MenuState& st) {
@@ -325,7 +345,7 @@ void Menu::drawPanel(MenuState& st) {
 
   dl->AddRectFilled(ImVec2(px, py), ImVec2(wp.x + ws.x, py + ph), C_PANEL);
 
-  ModuleDef* sel = findMod(selModuleId_.c_str());
+  mods::Module* sel = reg_->find(selModuleId_);
   float y = py + 14;
   float tx = px + PAD;
   float cw = PANEL_W - PAD * 2;
@@ -336,14 +356,14 @@ void Menu::drawPanel(MenuState& st) {
   }
 
   // category + name
-  dl->AddText(ImVec2(tx, y), C_ACCENT, sel->category.c_str());
+  dl->AddText(ImVec2(tx, y), C_ACCENT, sel->category().c_str());
   y += 18;
-  dl->AddText(nullptr, 22.f, ImVec2(tx, y), C_TEXT, sel->name.c_str());
+  dl->AddText(nullptr, 22.f, ImVec2(tx, y), C_TEXT, sel->name().c_str());
   y += 30;
 
   // description (wrapped)
   {
-    std::string dStr = sel->desc;
+    std::string dStr = sel->desc();
     const char* d = dStr.c_str();
     float wrapW = cw;
     ImVec2 sz = ImGui::CalcTextSize(d);
@@ -369,60 +389,42 @@ void Menu::drawPanel(MenuState& st) {
     ImGui::PushID("panel_toggle");
     ImGui::InvisibleButton("##tgl", ImVec2(40, 16));
     drawSwImpl(dl, ImVec2(tx, y), sel->enabled);
-    if (ImGui::IsItemClicked()) sel->enabled = !sel->enabled;
+    if (ImGui::IsItemClicked()) {
+      sel->enabled = !sel->enabled;
+      reg_->markChanged();
+    }
     ImGui::PopID();
     dl->AddText(ImVec2(tx + 50, y + 1), C_TEXT, sel->enabled ? "Включено" : "Выключено");
     y += 28;
   }
 
-  // ESP-specific settings
-  if (sel->id == "esp") {
-    y += 6;
-    drawSliderRow("FOV", &st.espFov, 30.f, 110.f, "%.0f°", tx, &y, cw);
-    drawSliderRow("Дистанция", &st.espDistance, 16.f, 256.f, "%.0f м", tx, &y, cw);
-    y += 4;
-    drawToggleRow("Мобы", &st.espShowMobs, tx, &y);
-    drawToggleRow("Игроки", &st.espShowPlayers, tx, &y);
-    drawToggleRow("Предметы", &st.espShowItems, tx, &y);
-    drawToggleRow("Прочее", &st.espShowMisc, tx, &y);
-    y += 6;
+  // settings in declaration order; keybinds go last
+  y += 6;
+  for (auto& s : sel->settings()) {
+    switch (s.type) {
+      case mods::Setting::Type::Bool:
+        drawToggleRow(s.label.c_str(), &s.b, tx, &y);
+        break;
+      case mods::Setting::Type::Float:
+        drawSliderRow(s.label.c_str(), &s.f, s.min, s.max, s.fmt, tx, &y, cw);
+        break;
+      case mods::Setting::Type::Enum: drawEnumRow(s, tx, &y, cw); break;
+      case mods::Setting::Type::Key: break;
+    }
   }
-
-  // key binding
-  dl->AddText(ImVec2(tx, y), C_DIM, "Клавиша");
-  y += 16;
-  {
-    ImGui::SetCursorScreenPos(ImVec2(tx, y));
-    ImGui::PushID("panel_key");
-    ImVec2 ksz = ImVec2(cw, 26);
-    dl->AddRectFilled(ImVec2(tx, y), ImVec2(tx, y) + ksz, C_TILE);
-    dl->AddText(ImVec2(tx + 8, y + 5), C_TEXT,
-                listenKey_ ? "Нажмите клавишу…" : sel->key.c_str());
-    ImGui::InvisibleButton("##key", ksz);
-    if (ImGui::IsItemClicked()) listenKey_ = !listenKey_;
-    ImGui::PopID();
-    y += 32;
-  }
+  y += 6;
+  for (auto& s : sel->settings())
+    if (s.type == mods::Setting::Type::Key) drawKeyRow(s, tx, &y, cw);
 
   // live data section
-  if (py + ph - y > 50) {
+  if (py + ph - y > 50 && !sel->liveRows.empty()) {
     dl->AddRectFilled(ImVec2(tx, y), ImVec2(tx + cw, y + 2), C_TILE);
     y += 8;
     dl->AddText(ImVec2(tx, y), C_DIM, "ЖИВЫЕ ДАННЫЕ");
     y += 18;
-    if (sel->id == "esp") {
-      char buf[128];
-      snprintf(buf, sizeof(buf), "Сущностей: %zu", st.espEntities);
-      dl->AddText(ImVec2(tx, y), C_TEXT, buf);
-      y += 16;
-      snprintf(buf, sizeof(buf), "FOV: %.0f°", st.espFov);
-      dl->AddText(ImVec2(tx, y), C_TEXT, buf);
-      y += 16;
-      snprintf(buf, sizeof(buf), "Дистанция: %.0f м", st.espDistance);
-      dl->AddText(ImVec2(tx, y), C_TEXT, buf);
-      y += 16;
-    } else if (sel->id == "coords") {
-      dl->AddText(ImVec2(tx, y), C_TEXT, st.playerLine.c_str());
+    for (auto& [k, v] : sel->liveRows) {
+      if (y + 16 > py + ph - PAD) break;
+      dl->AddText(ImVec2(tx, y), C_TEXT, (k.empty() ? v : k + ": " + v).c_str());
       y += 16;
     }
   }

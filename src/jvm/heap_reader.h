@@ -88,8 +88,11 @@ private:
     size_t size() const { return bottoms.size(); }
   };
   RegionList collectRegions(const mem::Process& p, const JvmRuntime& rt) const;
-  // CollectedHeap::_reserved as [start, end). JDK 21 dropped MemRegion from
-  // VMStructs, so the raw {_start, _byte_size|_end} pair is parsed directly.
+  // One candidate region-table read (embedded or pointer _hrm layout).
+  RegionList collectRegionsHrm(uint64_t hrm, const mem::Process& p,
+                               const JvmRuntime& rt) const;
+  // CollectedHeap::_reserved as [start, end). JDK 21 publishes the size in
+  // HeapWords (MemRegion::_word_size); older JDKs are parsed by shape.
   std::optional<std::pair<uint64_t, uint64_t>> reservedRange(const mem::Process& p,
                                                              const JvmRuntime& rt) const;
   std::map<uint64_t, size_t> sampleKlassIds(const mem::Process& p, const RegionList& rl,
