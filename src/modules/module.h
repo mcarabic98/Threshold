@@ -11,20 +11,29 @@
 #include "mc/game_model.h"
 #include "memory/process.h"
 
+namespace ui { struct MenuState; }
+
 namespace mods {
 
 // Per-frame world state handed to every module. Owned by App; valid for the
 // duration of update() only.
+class ModuleRegistry;
+
 struct ModuleContext {
   mem::Process* proc = nullptr;
   mc::GameModel* model = nullptr;
+  ModuleRegistry* registry = nullptr;
   bool attached = false;
   bool modelValid = false;
-  float dt = 0.f;          // frame delta, seconds
-  ImVec2 winPos{0, 0};     // screen-space origin of the game client area
-  ImVec2 winSize{0, 0};
-  bool playerValid = false; // player snapshot, read by App once per frame
-  mc::EntitySnapshot player;
+  mc::EntitySnapshot player{};
+  bool playerValid = false;
+  mc::CameraSnapshot camera{};
+  float fps = 0.f;
+  float fovDeg = 70.f; // effective vertical FOV in degrees (from FovModule)
+  // Overlay region of the actual Minecraft viewport in screen coords.
+  ImVec2 winPos{0.f, 0.f};
+  ImVec2 winSize{0.f, 0.f};
+  float dt = 0.f;
 };
 
 // One user-tunable module option. The menu renders a row per type; id is the

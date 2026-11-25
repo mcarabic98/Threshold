@@ -47,13 +47,23 @@ void OverlayWindow::show(bool on) {
 void OverlayWindow::setClickThrough(bool on) {
   if (!hwnd_ || on == clickThrough_) return;
   LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
-  if (on)
-    ex |= WS_EX_TRANSPARENT;
-  else
-    ex &= ~(LONG_PTR)WS_EX_TRANSPARENT;
+  if (on) {
+    ex |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+  } else {
+    ex &= ~((LONG_PTR)WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+  }
   SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex);
-  SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+  // When becoming interactive, allow activation so ImGui receives focus/clicks.
+  // When going click-through, keep the window non-activating to avoid stealing
+  // focus from the game.
+  UINT swp = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED;
+  if (on) swp |= SWP_NOACTIVATE;
+  SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, swp);
+  if (!on) {
+    // Best-effort: hotkey path should allow this; fallback to SetFocus.
+    SetForegroundWindow(hwnd_);
+    SetFocus(hwnd_);
+  }
   clickThrough_ = on;
 }
 

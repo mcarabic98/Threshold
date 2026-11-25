@@ -67,7 +67,7 @@ private:
   std::atomic<bool> scanCancel_{false};
 
   // overlay + modules
-  overlay::OverlayWindow win_;
+  overlay::OverlayWindow ov_;
   overlay::Renderer rend_;
   ui::Menu menu_;
   ui::MenuState menuState_;

@@ -19,6 +19,7 @@ inline constexpr ImU32 C_RED = IM_COL32(0xf2, 0x50, 0x22, 255);
 inline constexpr ImU32 C_YELLOW = IM_COL32(0xff, 0xb9, 0x00, 255);
 inline constexpr ImU32 C_PURPLE = IM_COL32(0x8e, 0x44, 0xad, 255);
 inline constexpr ImU32 C_TEAL = IM_COL32(0x00, 0xab, 0xa9, 255);
+inline constexpr ImU32 C_CYAN = IM_COL32(0x00, 0xff, 0xff, 255);
 inline constexpr ImU32 C_DARKRED = IM_COL32(0xe5, 0x14, 0x00, 255);
 
 } // namespace ui

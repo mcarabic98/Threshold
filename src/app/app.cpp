@@ -12,7 +12,10 @@
 
 #include "core/util.h"
 #include "modules/esp.h"
+#include "modules/fov.h"
 #include "modules/hud.h"
+#include "modules/radar.h"
+#include "modules/tracers.h"
 #include "ui/theme.h"
 
 // Declared under '#if 0' in imgui_impl_win32.h by design — forward-declare here.
@@ -40,13 +43,13 @@ int App::run(const config::Config& cfg) {
       "net/minecraft/class_1297", // Entity
   };
 
-  if (!win_.create(GetModuleHandleW(nullptr), L"Threshold overlay")) return 1;
+  if (!ov_.create(GetModuleHandleW(nullptr), L"Threshold overlay")) return 1;
 
-  win_.hook_ = [this](HWND h, UINT m, WPARAM wp, LPARAM lp, bool& handled) -> LRESULT {
+  ov_.hook_ = [this](HWND h, UINT m, WPARAM wp, LPARAM lp, bool& handled) -> LRESULT {
     if (m == WM_HOTKEY) {
       if (wp == HK_MENU) {
         menuOpen_ = !menuOpen_;
-        win_.setClickThrough(!menuOpen_);
+        ov_.setClickThrough(!menuOpen_);
         handled = true;
         return 0;
       }
@@ -60,19 +63,19 @@ int App::run(const config::Config& cfg) {
     return 0;
   };
 
-  if (!rend_.init(win_.hwnd(), 640, 400)) {
+  if (!rend_.init(ov_.hwnd(), 640, 400)) {
     spdlog::error("renderer init failed");
-    win_.destroy();
+    ov_.destroy();
     return 1;
   }
 
   // Visible from the start: status panel while scanning; snaps to MC on attach.
   menuOpen_ = true;
-  win_.setClickThrough(false);
-  win_.show(true);
+  ov_.setClickThrough(false);
+  ov_.show(true);
 
-  RegisterHotKey(win_.hwnd(), HK_MENU, MOD_NOREPEAT, cfg.menuKey);
-  RegisterHotKey(win_.hwnd(), HK_QUIT, MOD_NOREPEAT, cfg.exitKey);
+  RegisterHotKey(ov_.hwnd(), HK_MENU, MOD_NOREPEAT, cfg.menuKey);
+  RegisterHotKey(ov_.hwnd(), HK_QUIT, MOD_NOREPEAT, cfg.exitKey);
   spdlog::info("overlay ready. INSERT - menu, END - quit");
 
   MSG msg = {};
@@ -105,10 +108,10 @@ int App::run(const config::Config& cfg) {
 
   detach();
   syncConfig(true); // flush pending module edits on the way out
-  UnregisterHotKey(win_.hwnd(), HK_MENU);
-  UnregisterHotKey(win_.hwnd(), HK_QUIT);
+  UnregisterHotKey(ov_.hwnd(), HK_MENU);
+  UnregisterHotKey(ov_.hwnd(), HK_QUIT);
   rend_.shutdown();
-  win_.destroy();
+  ov_.destroy();
   return 0;
 }
 
@@ -145,8 +148,8 @@ void App::tryAttach() {
 
   attached_ = true;
   menuOpen_ = false;
-  win_.show(true);
-  win_.setClickThrough(true);
+  ov_.show(true);
+  ov_.setClickThrough(true);
   spdlog::info("attached: pid={} window='{}' mappings='{}' ({} targets)", best->pid,
                util::toUtf8(best->title),
                mapping_.builtin ? "builtin " + mapping_.version : mapping_.version,
@@ -444,7 +447,7 @@ void App::detach() {
   scanCancel_ = true;
   if (scanThread_.joinable()) scanThread_.join();
   scanState_ = 0;
-  win_.show(false);
+  ov_.show(false);
   proc_.detach();
   jvm_.reset();
   heap_ = {};
@@ -469,7 +472,7 @@ void App::pollTarget() {
   int w = rc.right - rc.left;
   int h = rc.bottom - rc.top;
   if (w <= 0 || h <= 0) return;
-  win_.setBounds(tl.x, tl.y, w, h);
+  ov_.setBounds(tl.x, tl.y, w, h);
   rend_.resize(w, h);
 }
 
@@ -482,11 +485,16 @@ void App::frame() {
   mods::ModuleContext ctx;
   ctx.proc = &proc_;
   ctx.model = &model_;
+  ctx.registry = &mods_;
   ctx.attached = attached_;
   ctx.modelValid = attached_ && model_.valid();
   ctx.dt = ImGui::GetIO().DeltaTime;
   ctx.playerValid = lastPsValid_;
   ctx.player = lastPs_;
+  if (ctx.modelValid) {
+    mc::CameraSnapshot cam;
+    if (model_.readCamera(proc_, cam)) ctx.camera = cam;
+  }
   if (attached_) {
     RECT rc = {};
     POINT tl = {0, 0};
@@ -494,6 +502,12 @@ void App::frame() {
       ctx.winPos = ImVec2((float)tl.x, (float)tl.y);
       ctx.winSize = ImVec2((float)(rc.right - rc.left), (float)(rc.bottom - rc.top));
     }
+  }
+
+  // Update FOV provider first so other modules see the current effective FOV.
+  if (auto* fovMod = mods::FovModule::get(mods_)) {
+    fovMod->update(ctx);
+    ctx.fovDeg = fovMod->fovDeg();
   }
 
   rend_.beginFrame();
@@ -505,21 +519,23 @@ void App::frame() {
 }
 
 void App::buildRegistry() {
-  using mods::Module;
+  mods_.add(std::make_unique<mods::FovModule>());
   mods_.add(std::make_unique<mods::EspModule>());
-  mods_.add(std::make_unique<Module>("aim", "Aimbot", 0xE7B3, ui::C_GREEN, "Combat",
+  mods_.add(std::make_unique<mods::RadarModule>());
+  mods_.add(std::make_unique<mods::TracersModule>());
+  mods_.add(std::make_unique<mods::Module>("aim", "Aimbot", 0xE7B3, ui::C_GREEN, "Combat",
                                      "Плавное наведение на ближайшую цель.", false, false, 'R'));
-  mods_.add(std::make_unique<Module>("hitbox", "Хитбоксы", 0xE7A8, ui::C_TEAL, "Combat",
+  mods_.add(std::make_unique<mods::Module>("hitbox", "Хитбоксы", 0xE7A8, ui::C_TEAL, "Combat",
                                      "Показ хитбоксов существ в мире.", false, false, VK_F3));
-  mods_.add(std::make_unique<Module>("bright", "Яркость", 0xE706, ui::C_YELLOW, "Визуал",
+  mods_.add(std::make_unique<mods::Module>("bright", "Яркость", 0xE706, ui::C_YELLOW, "Визуал",
                                      "Полная яркость в тёмных местах.", false, false, 'B'));
-  mods_.add(std::make_unique<Module>("zoom", "Зум", 0xE721, ui::C_BLUE, "Визуал",
+  mods_.add(std::make_unique<mods::Module>("zoom", "Зум", 0xE721, ui::C_BLUE, "Визуал",
                                      "Приближение камеры по клавише.", false, false, 'C'));
   mods_.add(std::make_unique<mods::FpsModule>());
   mods_.add(std::make_unique<mods::CoordsModule>());
-  mods_.add(std::make_unique<Module>("keys", "Клавиши", 0xE765, ui::C_DARKRED, "HUD",
+  mods_.add(std::make_unique<mods::Module>("keys", "Клавиши", 0xE765, ui::C_DARKRED, "HUD",
                                      "Нажатия WASD и мыши.", false, false));
-  mods_.add(std::make_unique<Module>("ping", "Пинг", 0xE8BD, ui::C_TEAL, "HUD",
+  mods_.add(std::make_unique<mods::Module>("ping", "Пинг", 0xE8BD, ui::C_TEAL, "HUD",
                                      "Задержка до сервера.", false, false));
 }
 

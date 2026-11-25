@@ -24,6 +24,9 @@ add_executable(threshold
   src/mc/game_model.cpp
   src/mc/mappings.cpp
   src/modules/module.cpp
+  src/modules/fov.cpp
+  src/modules/radar.cpp
+  src/modules/tracers.cpp
   src/modules/esp.cpp
   src/modules/hud.cpp
   src/overlay/overlay_window.cpp

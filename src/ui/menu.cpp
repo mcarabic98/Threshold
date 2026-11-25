@@ -111,9 +111,10 @@ void Menu::drawHeader(MenuState& st) {
   const char* status = st.attached ? (st.jvmOk ? "attached" : "partial") : "off";
   dl->AddText(ImVec2(wp.x + w - PAD - 130, wp.y + HEADER_H / 2 - 8), C_DIM, status);
 
-  // drag area
-  ImGui::SetCursorScreenPos(wp);
-  ImGui::InvisibleButton("##hdr_drag", ImVec2(w - 150, HEADER_H));
+  // drag area — full header width, inset from nav panel (140) + right padding
+  // so clicks on right-side UI elements (status dot, menu title) don't trigger drag.
+  ImGui::SetCursorScreenPos(ImVec2(wp.x + NAV_W, wp.y));
+  ImGui::InvisibleButton("##hdr_drag", ImVec2(w - NAV_W - PAD * 2, HEADER_H));
   if (ImGui::IsItemActive()) {
     ImVec2 d = ImGui::GetIO().MouseDelta;
     ImGui::SetWindowPos(ImGui::GetWindowPos() + d);

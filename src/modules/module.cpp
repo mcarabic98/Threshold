@@ -127,6 +127,8 @@ void ModuleRegistry::updateEnabled(const ModuleContext& ctx) {
       m->liveRows.clear();
       continue;
     }
+    // FOV module is updated separately by App before the frame so ctx.fovDeg is fresh.
+    if (m->id() == "fov") continue;
     m->update(ctx);
   }
 }

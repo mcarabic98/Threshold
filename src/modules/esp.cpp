@@ -51,8 +51,6 @@ EspModule::EspModule()
     : Module("esp", "ESP", 0xE81C, ui::C_RED, "Combat",
              "Подсветка сущностей: мобы, игроки, предметы. Цвет по типу.",
              /*wide=*/false, /*defEnabled=*/true) {
-  addBool("fovManual", "FOV вручную", false);
-  addFloat("fov", "FOV", 70.f, 30.f, 110.f, "%.0f°");
   addFloat("distance", "Дистанция", 128.f, 16.f, 256.f, "%.0f м");
   addBool("mobs", "Мобы", true);
   addBool("players", "Игроки", true);
@@ -65,8 +63,6 @@ void EspModule::update(const ModuleContext& ctx) {
   const mem::Process& proc = *ctx.proc;
   mc::GameModel& model = *ctx.model; // read*() are non-const: they fill field caches
 
-  const bool fovManual = boolVal("fovManual");
-  const float fovSet = floatVal("fov", 70.f);
   const float maxDist = floatVal("distance", 128.f);
   const bool showMobs = boolVal("mobs", true), showPlayers = boolVal("players", true);
   const bool showItems = boolVal("items"), showMisc = boolVal("misc");
@@ -119,14 +115,7 @@ void EspModule::update(const ModuleContext& ctx) {
   view[13] = py;
   view[14] = pz;
 
-  // re-read the game FOV every 5 seconds: file first, then heap chain
-  auto nowFov = std::chrono::steady_clock::now();
-  if (!fovManual && std::chrono::duration<double>(nowFov - lastFovRead_).count() > 5.0) {
-    lastFovRead_ = nowFov;
-    cachedFov_ = model.readFovFromFile(proc);
-    if (cachedFov_ <= 70.1f && cachedFov_ >= 69.9f) cachedFov_ = model.readFov(proc);
-  }
-  float fovDeg = fovManual ? fovSet : cachedFov_;
+  const float fovDeg = std::clamp(ctx.fovDeg, 30.f, 170.f);
   float fovY = fovDeg * 3.14159265f / 180.f;
   float aspect = (float)w / (float)h;
   float tz = 1.f / std::tan(fovY * 0.5f);
