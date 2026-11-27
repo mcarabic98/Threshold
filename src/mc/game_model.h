@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -60,6 +61,10 @@ public:
   bool readPlayer(const mem::Process& p, EntitySnapshot& out);
   bool readCamera(const mem::Process& p, CameraSnapshot& out);
   bool readEntities(const mem::Process& p, std::vector<EspEntity>& out);
+  // Tick-interpolation phase in [0, 1]: fraction of the current 50 ms tick
+  // elapsed, estimated from observed entity position changes. Renderers use
+  // it exactly like the game's partialTick.
+  double tickPartial() const;
   float readFov(const mem::Process& p);       // degrees, 70 fallback (heap chain)
   float readFovFromFile(const mem::Process& p); // degrees from options.txt (PEB cwd)
   void setGameVersion(const std::string& v) { gameVersion_ = v; }
@@ -110,6 +115,17 @@ private:
   int64_t aabbMinX_ = -1;                           // AABB: 6 doubles from here
   int64_t prevX_ = -1, prevY_ = -1, prevZ_ = -1;    // xo/yo/zo offsets in Entity
   int64_t offOptions_ = -1;                         // Options inside class_310
+
+  // Per-entity tick interpolation: prev = our previous-frame cur (exactly the
+  // game's xo/yo/zo semantics), phase from the latest observed position
+  // change (entity ticks are synchronized across the world).
+  struct EntTick {
+    bool has = false;
+    double cur[3] = {0, 0, 0};
+    double prev[3] = {0, 0, 0};
+  };
+  std::map<uint64_t, EntTick> entTick_;
+  std::chrono::steady_clock::time_point lastTickChange_{};
   int64_t offFovOpt_ = -1;                          // fov OptionInstance inside Options
   int64_t offOptValue_ = -1;                        // OptionInstance.value (Object)
   int64_t doubleValue_ = -1;                        // java/lang/Double.value (D)

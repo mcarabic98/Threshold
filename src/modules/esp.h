@@ -4,17 +4,12 @@
 namespace mods {
 
 // ESP: entity AABBs projected to the overlay, colored by classification.
-// The former App::drawEsp, unchanged; the menu filters became module settings.
+// Interpolation state lives in GameModel (per-entity tick cache); the module
+// only renders.
 class EspModule : public Module {
 public:
   EspModule();
   void update(const ModuleContext& ctx) override;
-
-private:
-  // tick-phase estimation: the player position change pins the 20 tps phase
-  std::chrono::steady_clock::time_point lastPosChange_{};
-  mc::EntitySnapshot lastPlayer_{};
-  bool hasLastPlayer_ = false;
 };
 
 } // namespace mods

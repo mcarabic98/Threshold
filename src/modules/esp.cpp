@@ -137,29 +137,20 @@ void EspModule::update(const ModuleContext& ctx) {
   ImDrawList* dl = ImGui::GetForegroundDrawList();
   ImU32 colorTxt = IM_COL32(255, 255, 255, 230);
 
-  // tick-rate interpolation: MC entities update positions at 20 tps; the
-  // renderer interpolates with partialTicks. Track the player position change
-  // to estimate the tick phase, then extrapolate every entity the same way.
-  auto now = std::chrono::steady_clock::now();
-  mc::EntitySnapshot ps;
-  if (model.readPlayer(proc, ps) && ps.valid) {
-    if (hasLastPlayer_ &&
-        (std::abs(ps.x - lastPlayer_.x) > 1e-9 || std::abs(ps.y - lastPlayer_.y) > 1e-9 ||
-         std::abs(ps.z - lastPlayer_.z) > 1e-9))
-      lastPosChange_ = now;
-    lastPlayer_ = ps;
-    hasLastPlayer_ = true;
-  }
-  double partial = std::chrono::duration<double>(now - lastPosChange_).count() / 0.05;
-  partial = std::clamp(partial, 0.0, 1.15);
+  // tick-rate interpolation: MC renders prev + (cur - prev) * partialTick.
+  // prev/cur come from the model's per-entity tick cache and the phase from
+  // the latest observed position change across entities — correct even when
+  // the local player stands still. The AABB matches cur, so the render shift
+  // is delta * (partial - 1).
+  double partial = model.tickPartial();
+  double interp = partial - 1.0;
 
   double cx2 = cam.pos[0], cy2 = cam.pos[1], cz2 = cam.pos[2];
   for (auto& e : ents) {
-    // extrapolate: cur + (cur - prev) * partialTick
-    double dx = (e.cur[0] - e.prev[0]) * partial;
-    double dy = (e.cur[1] - e.prev[1]) * partial;
-    double dz = (e.cur[2] - e.prev[2]) * partial;
-    // project the 8 AABB corners, shifted by the extrapolation delta
+    double dx = (e.cur[0] - e.prev[0]) * interp;
+    double dy = (e.cur[1] - e.prev[1]) * interp;
+    double dz = (e.cur[2] - e.prev[2]) * interp;
+    // project the 8 AABB corners, shifted by the interpolation delta
     ImVec2 minS(1e9f, 1e9f), maxS(-1e9f, -1e9f);
     int okCount = 0;
     for (int c = 0; c < 8; ++c) {

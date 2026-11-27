@@ -28,7 +28,13 @@ constexpr int kCatColors[8] = {
 RadarModule::RadarModule()
     : Module("radar", "Радар", 0xE909, ui::C_PURPLE, "Визуал",
              "2D-радар сверху: сущности вокруг игрока, повернут по yaw.",
-             /*wide=*/false, /*defEnabled=*/false) {}
+             /*wide=*/false, /*defEnabled=*/false) {
+  addFloat("range", "Радиус", 64.f, 16.f, 256.f, "%.0f м");
+  addBool("mobs", "Мобы", true);
+  addBool("players", "Игроки", true);
+  addBool("items", "Предметы", false);
+  addBool("misc", "Прочее", false);
+}
 
 void RadarModule::update(const ModuleContext& ctx) {
   if (!ctx.playerValid || !ctx.model) return;
@@ -58,16 +64,27 @@ void RadarModule::update(const ModuleContext& ctx) {
   const float yawRad = ctx.player.yaw * kPi / 180.f;
   const float cosYaw = std::cos(yawRad);
   const float sinYaw = std::sin(yawRad);
-  const float range = 64.f; // blocks
+  const float range = floatVal("range", 64.f);
+  const bool showMobs = boolVal("mobs", true), showPlayers = boolVal("players", true);
+  const bool showItems = boolVal("items"), showMisc = boolVal("misc");
 
   int shown = 0;
   std::vector<mc::EspEntity> ents;
   if (!ctx.model->readEntities(*ctx.proc, ents)) return;
+  // same interpolation as ESP: rendered position = cur + delta*(partial-1)
+  double partial = ctx.model->tickPartial();
+  double interp = partial - 1.0;
   for (const auto& e : ents) {
     if (e.self) continue;
+    switch (e.category) {
+      case (int)mc::EntCat::Mob: if (!showMobs) continue; break;
+      case (int)mc::EntCat::Player: if (!showPlayers) continue; break;
+      case (int)mc::EntCat::Item: if (!showItems) continue; break;
+      default: if (!showMisc) continue; break;
+    }
 
-    double ex = (e.bbMin[0] + e.bbMax[0]) * 0.5;
-    double ez = (e.bbMin[2] + e.bbMax[2]) * 0.5;
+    double ex = (e.bbMin[0] + e.bbMax[0]) * 0.5 + (e.cur[0] - e.prev[0]) * interp;
+    double ez = (e.bbMin[2] + e.bbMax[2]) * 0.5 + (e.cur[2] - e.prev[2]) * interp;
     float dx = float(ex - ctx.player.x);
     float dz = float(ez - ctx.player.z);
 

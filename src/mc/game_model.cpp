@@ -998,6 +998,43 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
       } else {
         continue;
       }
+
+      // Tick interpolation state: prev = our previous-frame cur — exactly the
+      // game's xo/yo/zo semantics, independent of the xo field heuristic. The
+      // phase (tickPartial) is estimated from the latest change across all
+      // entities (world ticks are synchronized), so it stays correct even
+      // when the local player stands still.
+      auto nowTick = std::chrono::steady_clock::now();
+      auto& tk = entTick_[obj];
+      if (!tk.has) {
+        tk.has = true;
+        tk.cur[0] = tk.prev[0] = e.cur[0];
+        tk.cur[1] = tk.prev[1] = e.cur[1];
+        tk.cur[2] = tk.prev[2] = e.cur[2];
+      } else if (tk.cur[0] != e.cur[0] || tk.cur[1] != e.cur[1] || tk.cur[2] != e.cur[2]) {
+        tk.prev[0] = tk.cur[0];
+        tk.prev[1] = tk.cur[1];
+        tk.prev[2] = tk.cur[2];
+        tk.cur[0] = e.cur[0];
+        tk.cur[1] = e.cur[1];
+        tk.cur[2] = e.cur[2];
+        lastTickChange_ = nowTick;
+      }
+      e.prev[0] = tk.prev[0];
+      e.prev[1] = tk.prev[1];
+      e.prev[2] = tk.prev[2];
+      if (entTick_.size() > 4096) {
+        // prune entities that left the world (not seen this pass)
+        std::set<uint64_t> alive;
+        for (auto& pe : out) alive.insert(pe.obj);
+        alive.insert(obj);
+        for (auto it = entTick_.begin(); it != entTick_.end();) {
+          if (!alive.count(it->first))
+            it = entTick_.erase(it);
+          else
+            ++it;
+        }
+      }
       bool pok = true;
       for (int c = 0; c < 3; ++c) {
         int64_t off = c == 0 ? prevX_ : c == 1 ? prevY_ : prevZ_;
@@ -1045,6 +1082,13 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
                   out.size(), maps.size(), statElems, statNonNull, statNamed, statPos, statBB);
   }
   return !out.empty();
+}
+
+double GameModel::tickPartial() const {
+  double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - lastTickChange_)
+                 .count() /
+             0.05;
+  return std::clamp(t, 0.0, 1.0);
 }
 
 float GameModel::readFovFromFile(const mem::Process& p) {
