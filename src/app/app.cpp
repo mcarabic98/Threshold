@@ -123,6 +123,17 @@ void App::tryAttach() {
   spdlog::debug("scan: {} visible windows, {} java candidates", cands.size(), javaCount);
 
   auto best = mc::pickBest(cands);
+  // THRESHOLD_PID=<pid> pins the target when several Java games are running
+  // (testing multi-version support without closing the other instances).
+  char pin[32]{};
+  if (GetEnvironmentVariableA("THRESHOLD_PID", pin, sizeof(pin)) > 0) {
+    DWORD want = (DWORD)strtoul(pin, nullptr, 10);
+    for (auto& c : cands)
+      if (c.hasJvm && c.pid == want) {
+        best = c;
+        break;
+      }
+  }
   if (!best) return;
   target_ = *best;
 
@@ -135,10 +146,11 @@ void App::tryAttach() {
   }
   heap_.resolve(proc_, jvm_);
 
-  // Mappings for the game version (window title -> version -> table).
+  // Mappings for the game version (window title -> version+loader -> table).
   std::string version = mc::versionFromTitle(best->title);
+  std::string loader = mc::loaderFromTitle(best->title);
   model_.setGameVersion(version);
-  mapping_ = mc::loadMappings(config::appDir() / L"mappings", version);
+  mapping_ = mc::loadMappings(config::appDir() / L"mappings", version, loader);
   targets_.clear();
   {
     std::set<std::string> s;

@@ -17,8 +17,19 @@ using jvm::JvmEnv;
 std::optional<int64_t> GameModel::fieldOffset(const std::vector<FieldDesc>& fs,
                                               const std::string& name,
                                               const std::string& desc) {
+  if (!name.empty())
+    for (auto& f : fs)
+      if (!f.isStatic && f.name == name && f.descriptor == desc) return (int64_t)f.offset;
+  // Nameless rules (SRG id unknown) and renamed fields: a unique descriptor
+  // match is still a safe resolution; ambiguous ones need caller validation.
+  const FieldDesc* hit = nullptr;
+  int n = 0;
   for (auto& f : fs)
-    if (!f.isStatic && f.name == name && f.descriptor == desc) return (int64_t)f.offset;
+    if (!f.isStatic && f.descriptor == desc) {
+      hit = &f;
+      ++n;
+    }
+  if (n == 1) return (int64_t)hit->offset;
   return std::nullopt;
 }
 
@@ -165,6 +176,8 @@ bool GameModel::init(const mem::Process& p, jvm::JvmRuntime& rt, jvm::KlassReade
 
   int depth = 0;
   bool entityFound = false;
+  std::vector<int64_t> posCandidates; // Vec3-typed fields of Entity, sorted
+  std::vector<int64_t> floatOffs;     // float fields of Entity, sorted
   while (k && depth++ < 12) {
     auto& fs = fields(p, rt, kr, k);
     auto nmSym = p.read<uint64_t>((uintptr_t)(k + env.offKlassName));
@@ -174,24 +187,16 @@ bool GameModel::init(const mem::Process& p, jvm::JvmRuntime& rt, jvm::KlassReade
     if (kname == *entityClass) {
       entityFound = true;
       entityKlass_ = k;
-      auto posVec = fieldOffset(fs, posRule->name, posRule->type);
-      if (!posVec) {
-        // Fallback: first Vec3-typed instance field.
-        for (auto& f : fs)
-          if (!f.isStatic && f.descriptor == posRule->type) {
-            posVec = (int64_t)f.offset;
-            break;
-          }
+      // Entity holds several Vec3s (position, deltaMovement, ...) and dozens
+      // of floats (yRot/xRot among them) — collect candidates now, resolve
+      // after the camera is known (position/rotation validate against it).
+      if (auto named = fieldOffset(fs, posRule->name, posRule->type))
+        offPositionVec_ = *named;
+      for (auto& f : fs) {
+        if (f.isStatic) continue;
+        if (f.descriptor == posRule->type) posCandidates.push_back((int64_t)f.offset);
+        if (f.descriptor == "F") floatOffs.push_back((int64_t)f.offset);
       }
-      if (!posVec) {
-        spdlog::warn("model: position Vec3 field not found in {}", *entityClass);
-        return false;
-      }
-      offPositionVec_ = *posVec;
-      if (yawRule)
-        if (auto o = fieldOffset(fs, yawRule->name, yawRule->type)) offYaw_ = *o;
-      if (xRotRule)
-        if (auto o = fieldOffset(fs, xRotRule->name, xRotRule->type)) offPitch_ = *o;
       break;
     }
     auto sup = kr.superClass(p, rt, k);
@@ -226,50 +231,72 @@ bool GameModel::init(const mem::Process& p, jvm::JvmRuntime& rt, jvm::KlassReade
   kr_ = &kr;
 
   // ESP offsets: level / gameRenderer / camera / entity lookup / AABB.
+  // Descriptors are built from the mapping's own class names — the runtime
+  // naming scheme differs per loader (intermediary vs official Mojang).
+  auto descOf = [&](const char* key) -> std::string {
+    auto n = map.className(key);
+    return n ? "L" + *n + ";" : std::string();
+  };
+  std::string descLevel = descOf("clientLevel");
+  std::string descGR = descOf("gameRenderer");
+  std::string descCam = descOf("camera");
+  std::string descVec3 = descOf("vec3");
+  std::string descAABB = descOf("aabb");
   auto byName = [](const std::vector<FieldDesc>& fs,
                    const std::string& name) -> const FieldDesc* {
     for (auto& f : fs)
       if (!f.isStatic && f.name == name) return &f;
     return nullptr;
   };
+  auto ruleName = [&](const char* key) -> std::string {
+    auto r = map.field(key);
+    return r ? r->name : std::string();
+  };
+  auto ruleType = [&](const char* key) -> std::string {
+    auto r = map.field(key);
+    return r && !r->type.empty() ? r->type : std::string();
+  };
   auto& mcFs = fields(p, rt, kr, mcKlass);
   spdlog::debug("model: esp: mcKlass={} mcFs={} fields", util::hex(mcKlass), mcFs.size());
-  if (auto lo = fieldOffset(mcFs, "field_1687", "Lnet/minecraft/class_638;")) offLevel_ = *lo;
-  // entitiesLookup (field_27733) lives in ClientLevel (class_638), not class_310.
-  if (auto lvFd = byName(mcFields, "field_1687")) {
-    if (auto lvObj = objectField(p, mcInstance_, *lvFd)) {
-      uint64_t lvKlass = klassOf(p, *lvObj);
-      auto& lvFs = fields(p, rt, kr, lvKlass);
-      if (auto es = fieldOffsetByDesc(lvFs, "Lnet/minecraft/class_5574;")) {
-        offEntitiesLookup_ = *es;
-        // Vec3.x/y/z + camera field re-verification against the live level
-        // object happens in readEntities; here we just confirm presence.
-      } else {
-        spdlog::warn("model: esp: no class_5574-typed field in ClientLevel");
-      }
-    } else {
-      spdlog::warn("model: esp: level object is null (main menu?)");
-    }
-  }
-  if (auto go = fieldOffset(mcFs, "field_1773", "Lnet/minecraft/class_757;")) {
-    offGameRenderer_ = *go;
-  } else {
-    spdlog::warn("model: esp: field_1773 not found in mc table ({} fields)", mcFs.size());
-    for (auto& f : mcFs)
-      if (f.descriptor == "Lnet/minecraft/class_757;")
-        spdlog::debug("model: esp: class_757 field: {} @ {} acc=0x{:X}", f.name, f.offset,
-                      f.accessFlags);
-  }
 
-  if (auto grFd = byName(mcFields, "field_1773")) {
-    if (auto grObj = objectField(p, mcInstance_, *grFd)) {
-      uint64_t grKlass = klassOf(p, *grObj);
+  // level: rule name first ("field_1687" / "f_91073_"), then unique type.
+  if (auto lo = fieldOffset(mcFs, ruleName("level"),
+                            ruleType("level").empty() ? descLevel : ruleType("level")))
+    offLevel_ = *lo;
+  else if (!descLevel.empty())
+    offLevel_ = fieldOffset(mcFs, {}, descLevel).value_or(-1);
+  // gameRenderer: same pattern.
+  if (auto go = fieldOffset(mcFs, ruleName("gameRenderer"),
+                            ruleType("gameRenderer").empty() ? descGR : ruleType("gameRenderer")))
+    offGameRenderer_ = *go;
+  else if (!descGR.empty())
+    offGameRenderer_ = fieldOffset(mcFs, {}, descGR).value_or(-1);
+  if (offGameRenderer_ < 0)
+    spdlog::warn("model: esp: gameRenderer field not found ({} fields)", mcFs.size());
+
+  auto objAt = [&](uint64_t obj, int64_t off) -> std::optional<uint64_t> {
+    if (off < 0 || !obj) return std::nullopt;
+    if (auto raw = p.read<uint32_t>((uintptr_t)(obj + (uint64_t)off)); raw && *raw)
+      return decodeOop(*raw);
+    return std::nullopt;
+  };
+  if (uint64_t grObj = 0; true) {
+    if (offGameRenderer_ >= 0) {
+      if (auto o = objAt(mcInstance_, offGameRenderer_)) grObj = *o;
+    } else if (auto grFd = byName(mcFields, ruleName("gameRenderer")); grFd) {
+      if (auto o = objectField(p, mcInstance_, *grFd)) grObj = *o;
+    }
+    if (grObj) {
+      uint64_t grKlass = klassOf(p, grObj);
       auto& grFs = fields(p, rt, kr, grKlass);
-      if (auto camFd = byName(grFs, "field_18765")) {
-        if (auto camObj = objectField(p, *grObj, *camFd)) {
+      // camera: unique Camera-typed field of GameRenderer (SRG id varies).
+      std::string camDesc = ruleType("camera").empty() ? descCam : ruleType("camera");
+      if (auto camFd = fieldOffset(grFs, ruleName("camera"), camDesc)) {
+        if (auto camObj = objAt(grObj, *camFd)) {
           uint64_t camKlass = klassOf(p, *camObj);
           auto& camFs = fields(p, rt, kr, camKlass);
-          if (auto o = fieldOffsetByDesc(camFs, "Lnet/minecraft/class_243;")) offCamPos_ = *o;
+          if (!descVec3.empty())
+            if (auto o = fieldOffsetByDesc(camFs, descVec3)) offCamPos_ = *o;
           int seen = 0;
           for (auto& f : camFs) {
             if (f.isStatic || f.descriptor != "Lorg/joml/Vector3f;") continue;
@@ -278,40 +305,132 @@ bool GameModel::init(const mem::Process& p, jvm::JvmRuntime& rt, jvm::KlassReade
             if (seen == 2) offCamLeft_ = (int64_t)f.offset;
             ++seen;
           }
-          if (auto vFd = byName(camFs, "field_18714")) {
-            if (auto vf = objectField(p, *camObj, *vFd)) {
+          // Vector3f component floats: from the first Vector3f object (the
+          // camera forwards) — its class has exactly three float fields.
+          for (auto& f : camFs) {
+            if (f.isStatic || f.descriptor != "Lorg/joml/Vector3f;") continue;
+            if (auto vf = objectField(p, *camObj, f)) {
               uint64_t vk = klassOf(p, *vf);
               int seen2 = 0;
-              for (auto& f : fields(p, rt, kr, vk)) {
-                if (f.isStatic || f.descriptor != "F") continue;
-                if (seen2 == 0) vec3fX_ = (int64_t)f.offset;
-                if (seen2 == 1) vec3fY_ = (int64_t)f.offset;
-                if (seen2 == 2) vec3fZ_ = (int64_t)f.offset;
+              for (auto& g : fields(p, rt, kr, vk)) {
+                if (g.isStatic || g.descriptor != "F") continue;
+                if (seen2 == 0) vec3fX_ = (int64_t)g.offset;
+                if (seen2 == 1) vec3fY_ = (int64_t)g.offset;
+                if (seen2 == 2) vec3fZ_ = (int64_t)g.offset;
                 ++seen2;
               }
             }
+            break;
           }
         }
-        offCamera_ = (int64_t)camFd->offset;
+        offCamera_ = *camFd;
+      } else {
+        spdlog::warn("model: esp: camera field not found in GameRenderer");
+      }
+    }
+  }
+
+  // Resolve the ambiguous Entity fields now that the camera is known: the
+  // player position shares x/z with the camera position (first person), and
+  // the player yaw/pitch match the camera rotation derived from its forwards
+  // vector. Without a usable camera (main menu) fall back to first candidates.
+  auto readD3 = [&](uint64_t obj, int64_t base, double out[3]) {
+    for (int c = 0; c < 3; ++c) {
+      auto v = p.read<double>((uintptr_t)(obj + (uint64_t)(base + (int64_t)c * 8)));
+      if (!v) return false;
+      out[c] = *v;
+    }
+    return true;
+  };
+  auto readF3 = [&](uint64_t obj, int64_t base, float out[3]) {
+    for (int c = 0; c < 3; ++c) {
+      auto v = p.read<float>((uintptr_t)(obj + (uint64_t)(base + (int64_t)c * 4)));
+      if (!v) return false;
+      out[c] = *v;
+    }
+    return true;
+  };
+  double camPos[3] = {0, 0, 0};
+  float camFwd[3] = {0, 0, 0};
+  bool haveCam = false;
+  if (auto camObj = objAt(objAt(mcInstance_, offGameRenderer_).value_or(0), offCamera_);
+      camObj && offCamPos_ >= 0 && offCamFwd_ >= 0 && vecX_ >= 0 && vec3fX_ >= 0) {
+    haveCam = readD3(*camObj, offCamPos_, camPos) && readF3(*camObj, offCamFwd_, camFwd);
+  }
+  if (offPositionVec_ < 0 && !posCandidates.empty()) {
+    for (auto off : posCandidates) {
+      if (auto po = objAt(playerObj, off)) {
+        double v[3];
+        if (readD3(*po, vecX_, v) && haveCam) {
+          if (std::abs(v[0] - camPos[0]) < 32.0 && std::abs(v[2] - camPos[2]) < 32.0) {
+            offPositionVec_ = off;
+            break;
+          }
+        }
+      }
+    }
+    if (offPositionVec_ < 0) offPositionVec_ = posCandidates.front();
+  }
+  if (!floatOffs.empty()) {
+    // MC rotation from the camera forwards vector: yaw = atan2(-fx, fz),
+    // pitch = -asin(fy) (positive pitch looks down).
+    double yaw = 0, pitch = 0;
+    bool haveRot = false;
+    if (haveCam) {
+      double fy = (double)camFwd[1];
+      yaw = std::atan2(-(double)camFwd[0], (double)camFwd[2]) * 180.0 / 3.14159265358979;
+      pitch = std::asin(std::clamp(fy, -1.0, 1.0)) * -180.0 / 3.14159265358979;
+      haveRot = true;
+    }
+    auto wrapDeg = [](double d) {
+      while (d > 180.0) d -= 360.0;
+      while (d < -180.0) d += 360.0;
+      return d;
+    };
+    for (size_t i = 0; i + 1 < floatOffs.size(); ++i) {
+      int64_t a = floatOffs[i], b = floatOffs[i + 1];
+      if (b - a != 4) continue;
+      if (haveRot) {
+        auto ya = p.read<float>((uintptr_t)(playerObj + (uint64_t)a));
+        auto xb = p.read<float>((uintptr_t)(playerObj + (uint64_t)b));
+        if (!ya || !xb) continue;
+        if (std::abs(wrapDeg((double)*ya - yaw)) < 4.0 &&
+            std::abs((double)*xb - pitch) < 4.0) {
+          offYaw_ = a;
+          offPitch_ = b;
+          break;
+        }
+      }
+    }
+    if (offYaw_ < 0) {
+      // first adjacent float pair as best-effort fallback
+      for (size_t i = 0; i + 1 < floatOffs.size(); ++i) {
+        if (floatOffs[i + 1] - floatOffs[i] == 4) {
+          offYaw_ = floatOffs[i];
+          offPitch_ = floatOffs[i + 1];
+          break;
+        }
       }
     }
   }
   // Entity boundingBox (AABB): field by descriptor on the entity class, plus
-  // the six double offsets inside class_238.
+  // the six double offsets inside the AABB class.
   {
     auto& entFs = fields(p, rt, kr, entityKlass_);
-    if (auto o = fieldOffsetByDesc(entFs, "Lnet/minecraft/class_238;")) offBB_ = *o;
-    if (offBB_ < 0 && entityKlass_) {
-      uint64_t kk = entityKlass_;
-      for (int d = 0; d < 12 && kk && offBB_ < 0; ++d) {
-        auto& fs2 = fields(p, rt, kr, kk);
-        if (auto o = fieldOffsetByDesc(fs2, "Lnet/minecraft/class_238;")) {
-          offBB_ = *o;
-          break;
+    if (!descAABB.empty()) {
+      if (auto o = fieldOffsetByDesc(entFs, descAABB)) offBB_ = *o;
+      if (offBB_ < 0 && entityKlass_) {
+        uint64_t kk = entityKlass_;
+        for (int d = 0; d < 12 && kk && offBB_ < 0; ++d) {
+          auto& fs2 = fields(p, rt, kr, kk);
+          if (auto o = fieldOffsetByDesc(fs2, descAABB)) {
+            offBB_ = *o;
+            break;
+          }
+          auto sup = kr.superClass(p, rt, kk);
+          if (!sup || !*sup) break;
+          kk = *sup;
         }
-        auto sup = kr.superClass(p, rt, kk);
-        if (!sup || !*sup) break;
-        kk = *sup;
       }
     }
     if (offBB_ >= 0) {
@@ -625,12 +744,19 @@ int GameModel::classifyEntity(const mem::Process& p, uint64_t klass) {
       }
       return false;
     };
-    if (reaches("class_1308")) cat = (int)EntCat::Mob;
-    else if (reaches("class_1657")) cat = (int)EntCat::Player;
-    else if (reaches("class_1530")) cat = (int)EntCat::ArmorStand;
-    else if (reaches("class_1666")) cat = (int)EntCat::Projectile;
-    else if (reaches("class_1665")) cat = (int)EntCat::Item;
-    else if (reaches("class_1309")) cat = (int)EntCat::Living;
+    // Superchain probes cover both runtime naming schemes: intermediary
+    // class_XXXX (Fabric/vanilla) and official Mojang paths (Forge/NeoForge).
+    auto reachesAny = [&](std::initializer_list<const char*> ids) {
+      for (auto* id : ids)
+        if (reaches(id)) return true;
+      return false;
+    };
+    if (reachesAny({"class_1308", "/entity/Mob"})) cat = (int)EntCat::Mob;
+    else if (reachesAny({"class_1657", "player/Player"})) cat = (int)EntCat::Player;
+    else if (reachesAny({"class_1530", "ArmorStand"})) cat = (int)EntCat::ArmorStand;
+    else if (reachesAny({"class_1666", "Projectile"})) cat = (int)EntCat::Projectile;
+    else if (reachesAny({"class_1665", "ItemEntity"})) cat = (int)EntCat::Item;
+    else if (reachesAny({"class_1309", "LivingEntity"})) cat = (int)EntCat::Living;
   }
   return categoryCache_.emplace(klass, cat).first->second;
 }
@@ -704,9 +830,78 @@ bool GameModel::readCamera(const mem::Process& p, CameraSnapshot& out) {
   return true;
 }
 
+// BFS over the oop graph rooted at the ClientLevel object, descending through
+// fastutil maps and their Object[] value arrays, collecting Int2ObjectMap
+// objects. The entity maps sit at different depths depending on version and
+// loader (Fabric 1.21: ClientLevel.entityStorage -> maps; Forge 1.20:
+// ClientLevel.entityManager -> PersistentEntitySectionManager ->
+// EntitySectionStorage -> Long2ObjectMap<EntitySection> -> EntitySection.storage
+// -> EntityLookup.entities), so a fixed field chain cannot be mapped — the
+// graph itself is the mapping.
+std::vector<uint64_t> GameModel::findEntityMaps(const mem::Process& p, uint64_t level) {
+  std::vector<uint64_t> maps;
+  if (!valid_ || !level) return maps;
+  std::set<uint64_t> seen;
+  std::vector<std::pair<uint64_t, int>> queue;
+  queue.emplace_back(level, 0);
+  seen.insert(level);
+  auto pushChild = [&](uint64_t obj, int d) {
+    if (!obj || d > 6 || seen.size() > 8192 || queue.size() > 2048) return;
+    if (seen.insert(obj).second) queue.emplace_back(obj, d);
+  };
+  size_t processed = 0;
+  while (processed < queue.size() && processed < 1024) {
+    auto [obj, d] = queue[processed++];
+    uint64_t k = klassOf(p, obj);
+    for (auto& f : fields(p, *rt_, *kr_, k)) {
+      if (f.isStatic) continue;
+      if (f.descriptor.rfind("Lit/unimi/dsi/fastutil/ints/Int2Object", 0) == 0) {
+        if (auto raw = p.read<uint32_t>((uintptr_t)(obj + (uint64_t)f.offset)); raw && *raw)
+          maps.push_back(decodeOop(*raw));
+        continue;
+      }
+      if (f.descriptor.rfind("Lit/unimi/dsi/fastutil/", 0) == 0) {
+        if (auto raw = p.read<uint32_t>((uintptr_t)(obj + (uint64_t)f.offset)); raw && *raw)
+          pushChild(decodeOop(*raw), d + 1);
+        continue;
+      }
+      if (f.descriptor == "[Ljava/lang/Object;") {
+        // fastutil map value array: descend into elements (EntitySection...)
+        if (auto raw = p.read<uint32_t>((uintptr_t)(obj + (uint64_t)f.offset)); raw && *raw) {
+          uint64_t arr = decodeOop(*raw);
+          auto alen = p.read<uint32_t>(arr + 12);
+          if (alen && *alen > 0 && *alen <= (1u << 16)) {
+            auto elems = p.readBytes(arr + 16, (size_t)std::min<uint32_t>(*alen, 4096) * 4);
+            for (size_t i = 0; i + 4 <= elems.size(); i += 4) {
+              uint32_t r2;
+              std::memcpy(&r2, elems.data() + i, 4);
+              if (r2) pushChild(decodeOop(r2), d + 1);
+            }
+          }
+        }
+        continue;
+      }
+      if (f.descriptor.rfind("Lnet/minecraft/", 0) == 0 && d < 5) {
+        // The entity storage path names every hop (EntityManager,
+        // EntitySectionStorage, EntitySection, EntityLookup) — descending
+        // only into entity-named classes keeps the budget away from huge
+        // irrelevant subtrees (LevelRenderer and friends).
+        if (auto raw = p.read<uint32_t>((uintptr_t)(obj + (uint64_t)f.offset)); raw && *raw) {
+          uint64_t child = decodeOop(*raw);
+          uint64_t ck = klassOf(p, child);
+          auto nmSym = p.read<uint64_t>((uintptr_t)(ck + rt_->env().offKlassName));
+          auto nm = nmSym && *nmSym ? rt_->readSymbol(p, *nmSym).value_or(std::string()) : "";
+          if (nm.find("ntity") != std::string::npos) pushChild(child, d + 1);
+        }
+      }
+    }
+  }
+  return maps;
+}
+
 bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out) {
   out.clear();
-  if (!valid_ || offLevel_ < 0 || offEntitiesLookup_ < 0 || offPositionVec_ < 0 || offBB_ < 0) {
+  if (!valid_ || offLevel_ < 0 || offPositionVec_ < 0 || offBB_ < 0) {
     return false;
   }
   const JvmEnv& env = rt_->env();
@@ -715,36 +910,50 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
   auto lvRaw = p.read<uint32_t>((uintptr_t)(mcInstance_ + (uint64_t)offLevel_));
   if (!lvRaw || !*lvRaw) return false;
   uint64_t level = decodeOop(*lvRaw);
-  auto esRaw = p.read<uint32_t>((uintptr_t)(level + (uint64_t)offEntitiesLookup_));
-  if (!esRaw || !*esRaw) return false;
-  uint64_t holder = decodeOop(*esRaw);
 
-  // The holder has two Int2ObjectMap-typed fields; both value arrays contain
-  // Entity oops. Iterate both, dedupe by address.
-  uint64_t holderKlass = klassOf(p, holder);
-  std::vector<uint64_t> maps;
-  for (auto& f : fields(p, *rt_, *kr_, holderKlass)) {
-    if (f.isStatic) continue;
-    if (f.descriptor != "Lit/unimi/dsi/fastutil/ints/Int2ObjectMap;") continue;
-    auto mRaw = p.read<uint32_t>((uintptr_t)(holder + (uint64_t)f.offset));
-    if (mRaw && *mRaw) maps.push_back(decodeOop(*mRaw));
+  // The entity maps hold Entity oops in their value arrays. Iterate all found
+  // maps, dedupe by address.
+  auto maps = findEntityMaps(p, level);
+  static std::chrono::steady_clock::time_point lastLog{};
+  if (maps.empty()) {
+    if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(2)) {
+      lastLog = std::chrono::steady_clock::now();
+      spdlog::debug("entities: no Int2Object maps reachable from level (BFS)");
+    }
+    return false;
   }
-  if (maps.empty()) return false;
+  if (std::chrono::steady_clock::now() - lastLog > std::chrono::seconds(2)) {
+    lastLog = std::chrono::steady_clock::now();
+    spdlog::debug("entities: {} candidate maps from BFS", maps.size());
+  }
 
-  // offsets of the value[] field inside Int2ObjectLinkedOpenHashMap
-  int64_t valueOff = -1;
-  {
-    uint64_t mk = klassOf(p, maps.front());
+  // offsets of the value[] field per map class — fastutil map classes have
+  // different layouts (OpenHashMap / LinkedOpenHashMap / ArrayMap), so the
+  // offset is resolved per klass and cached.
+  std::map<uint64_t, int64_t> valueOffByKlass;
+  auto valueOffFor = [&](uint64_t m) -> int64_t {
+    uint64_t mk = klassOf(p, m);
+    auto it = valueOffByKlass.find(mk);
+    if (it != valueOffByKlass.end()) return it->second;
+    int64_t off = -1;
     for (auto& f : fields(p, *rt_, *kr_, mk))
-      if (f.descriptor == "[Ljava/lang/Object;" && valueOff < 0) valueOff = (int64_t)f.offset;
-    if (valueOff < 0) return false;
-  }
+      if (f.descriptor == "[Ljava/lang/Object;") {
+        off = (int64_t)f.offset;
+        break;
+      }
+    valueOffByKlass.emplace(mk, off);
+    return off;
+  };
 
   std::set<uint64_t> seen;
   uint64_t localPlayer = 0;
   if (auto pRaw = p.read<uint32_t>((uintptr_t)(mcInstance_ + (uint64_t)offPlayer_)); pRaw && *pRaw)
     localPlayer = decodeOop(*pRaw);
-  for (uint64_t m : maps) {
+  size_t statElems = 0, statNonNull = 0, statNamed = 0, statPos = 0, statBB = 0;
+  for (size_t mi = 0; mi < maps.size(); ++mi) {
+    uint64_t m = maps[mi];
+    int64_t valueOff = valueOffFor(m);
+    if (valueOff < 0) continue;
     auto arrRaw = p.read<uint32_t>((uintptr_t)(m + (uint64_t)valueOff));
     if (!arrRaw || !*arrRaw) continue;
     uint64_t arr = decodeOop(*arrRaw);
@@ -754,7 +963,9 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
     for (size_t i = 0; i + 4 <= elems.size(); ++i) {
       uint32_t raw;
       std::memcpy(&raw, elems.data() + i, 4);
+      ++statElems;
       if (!raw) continue;
+      ++statNonNull;
       uint64_t obj = decodeOop(raw);
       if (!seen.insert(obj).second) continue;
       auto kid = p.read<uint32_t>(obj + 8);
@@ -766,6 +977,7 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
       e.obj = obj;
       e.className = klassName(p, kl);
       if (e.className.rfind("net/minecraft/", 0) != 0) continue;
+      ++statNamed;
       e.category = classifyEntity(p, kl);
       e.self = (obj == localPlayer);
       // current position (Vec3) + previous tick position (xo/yo/zo)
@@ -782,6 +994,7 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
           e.cur[c] = *v;
         }
         if (!ok) continue;
+        ++statPos;
       } else {
         continue;
       }
@@ -820,9 +1033,16 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
         (c < 3 ? e.bbMin[c] : e.bbMax[c - 3]) = d;
       }
       if (!ok) continue;
+      ++statBB;
       out.push_back(std::move(e));
       if (out.size() >= 256) return true;
     }
+  }
+  static std::chrono::steady_clock::time_point lastParsedLog{};
+  if (std::chrono::steady_clock::now() - lastParsedLog > std::chrono::seconds(2)) {
+    lastParsedLog = std::chrono::steady_clock::now();
+    spdlog::debug("entities: {} parsed from {} maps (elems={} nn={} named={} pos={} bb={})",
+                  out.size(), maps.size(), statElems, statNonNull, statNamed, statPos, statBB);
   }
   return !out.empty();
 }

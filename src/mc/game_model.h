@@ -87,6 +87,9 @@ private:
                                      const std::string& name, const std::string& desc);
   std::optional<int64_t> fieldOffsetByDesc(const std::vector<jvm::FieldDesc>& fs,
                                            const std::string& desc);
+  // BFS from the ClientLevel object collecting the Int2ObjectMap entity maps
+  // (path to them differs per version/loader — see the .cpp comment).
+  std::vector<uint64_t> findEntityMaps(const mem::Process& p, uint64_t level);
   uint64_t decodeOop(uint64_t raw) const;
 
   bool valid_ = false;

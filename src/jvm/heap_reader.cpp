@@ -10,6 +10,7 @@
 #include <unordered_set>
 
 #include "core/util.h"
+#include "jvm/klass_reader.h"
 
 namespace jvm {
 
@@ -770,6 +771,48 @@ HeapScanResult HeapReader::scan(const mem::Process& p, const JvmRuntime& rt,
     }
     spdlog::debug("heap: klass table {} entries, named {}, mc {}, with targetIdx {}",
                   state.table.size(), withName, withMc, withIdx);
+  }
+
+  // Zero-target diagnosis: the runtime class-naming scheme may not match the
+  // mapping table at all (e.g. Forge/NeoForge use official Mojang names while
+  // Fabric uses intermediary class_XXXX). Log a sample of the MC-named klasses
+  // and dump the well-known client singleton so the mismatch is visible in one
+  // run.
+  {
+    bool anyHit = false;
+    for (auto& [name, cnt] : r.targetCounts)
+      if (cnt > 0) { anyHit = true; break; }
+    if (!anyHit) {
+      static const char* kProbeNames[] = {
+          "net/minecraft/client/Minecraft", // Forge/NeoForge runtime (official)
+          "net/minecraft/class_310",        // Fabric/vanilla (intermediary)
+      };
+      size_t logged = 0;
+      uint64_t probe = 0;
+      for (auto& [key, ki] : state.table) {
+        if (!ki.mc) continue;
+        if (logged < 20) {
+          spdlog::debug("heap: mc klass sample '{}' @ {}", ki.name, util::hex(key));
+          ++logged;
+        }
+        for (const char* pn : kProbeNames)
+          if (ki.name == pn) probe = key;
+      }
+      if (probe) {
+        KlassReader kr;
+        kr.dumpClass(p, rt, probe, "probe");
+      }
+      // java/lang/String has a tiny well-known layout (value@16, hash@20,
+      // coder@24, hashIsZero@25 on x64) — a perfect reference for locking the
+      // legacy FieldInfo offset packing.
+      for (auto& [key, ki] : state.table) {
+        if (ki.name == "java/lang/String") {
+          KlassReader kr;
+          kr.dumpClass(p, rt, key, "String-ref");
+          break;
+        }
+      }
+    }
   }
 
   for (auto& c : ctxs) {

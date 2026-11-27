@@ -32,6 +32,13 @@ public:
   // One-shot diagnostic: log everything needed to decode FieldInfo/CP layouts.
   void dumpClass(const mem::Process& p, const JvmRuntime& rt, uint64_t klass,
                  const std::string& label);
+
+private:
+  // JDK <= 20 variant: _fields is a fixed-size Array<FieldInfo>; the entry
+  // layout is detected from the data at runtime.
+  bool readFieldsLegacy(const mem::Process& p, const JvmRuntime& rt, uint64_t klass,
+                        uint64_t fieldsArr, uint64_t cp, std::vector<FieldDesc>& out,
+                        std::string* err);
 };
 
 } // namespace jvm

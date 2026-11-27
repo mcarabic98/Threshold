@@ -99,8 +99,62 @@ std::string versionFromTitle(const std::wstring& title) {
   return "unknown";
 }
 
-MappingSet loadMappings(const std::filesystem::path& dir, const std::string& version) {
-  std::vector<std::string> names = {version + ".json", "default.json"};
+std::string loaderFromTitle(const std::wstring& title) {
+  std::string t;
+  t.reserve(title.size());
+  for (wchar_t c : title) {
+    if (c < 128) t += (char)(char)std::tolower((unsigned char)c);
+  }
+  if (t.find("neoforge") != std::string::npos) return "neoforge";
+  if (t.find("forge") != std::string::npos) return "forge";
+  if (t.find("fabric") != std::string::npos) return "fabric";
+  return {};
+}
+
+// Runtime naming per loader: Fabric/vanilla ship intermediary class_XXXX
+// names, Forge/NeoForge (1.17+) ship official Mojang class names with SRG
+// field names. Class names are stable across versions within a scheme; SRG
+// field names confirmed live on Forge 1.20.1 (JDK 17) — fields whose SRG id
+// is not pinned here resolve by descriptor type instead (see GameModel).
+MappingSet builtinOfficial() {
+  MappingSet m;
+  m.version = "official";
+  m.classes = {
+      {"minecraft", "net/minecraft/client/Minecraft"},
+      {"localPlayer", "net/minecraft/client/player/LocalPlayer"},
+      {"abstractClientPlayer", "net/minecraft/client/player/AbstractClientPlayer"},
+      {"player", "net/minecraft/world/entity/player/Player"},
+      {"livingEntity", "net/minecraft/world/entity/LivingEntity"},
+      {"entity", "net/minecraft/world/entity/Entity"},
+      {"clientLevel", "net/minecraft/client/multiplayer/ClientLevel"},
+      {"vec3", "net/minecraft/world/phys/Vec3"},
+      {"aabb", "net/minecraft/world/phys/AABB"},
+      {"gameRenderer", "net/minecraft/client/renderer/GameRenderer"},
+      {"camera", "net/minecraft/client/Camera"},
+      {"entityStorage", "net/minecraft/world/level/entity/EntitySectionStorage"},
+  };
+  m.fields = {
+      {"player", {"minecraft", "f_91074_", "Lnet/minecraft/client/player/LocalPlayer;"}},
+      {"level", {"minecraft", "f_91073_", "Lnet/minecraft/client/multiplayer/ClientLevel;"}},
+      {"gameRenderer",
+       {"minecraft", "f_91063_", "Lnet/minecraft/client/renderer/GameRenderer;"}},
+      {"camera", {"gameRenderer", "", "Lnet/minecraft/client/Camera;"}},
+      {"position", {"entity", "", "Lnet/minecraft/world/phys/Vec3;"}},
+      {"yRot", {"entity", "", "F"}},
+      {"xRot", {"entity", "", "F"}},
+  };
+  m.ok = true;
+  return m;
+}
+
+MappingSet loadMappings(const std::filesystem::path& dir, const std::string& version,
+                        const std::string& loader) {
+  std::vector<std::string> names;
+  if (!loader.empty()) names.push_back(version + "-" + loader + ".json");
+  names.push_back(version + ".json");
+  // default.json ships intermediary names — it must not hijack Forge/NeoForge
+  // sessions whose runtime classes are Mojang-mapped.
+  if (loader != "forge" && loader != "neoforge") names.push_back("default.json");
   for (auto& name : names) {
     std::filesystem::path p = dir / name;
     std::ifstream f(p);
@@ -118,11 +172,19 @@ MappingSet loadMappings(const std::filesystem::path& dir, const std::string& ver
       spdlog::warn("mappings: {} parse failed: {}", p.string(), e.what());
     }
   }
-  auto m = builtin1211();
-  if (version != "unknown" && version != m.version)
-    spdlog::warn("mappings: no table for version '{}', using built-in '{}' IDs "
-                 "(field offsets may mismatch)",
-                 version, m.version);
+  // Built-in fallback keyed by the runtime naming scheme: Forge/NeoForge run
+  // Mojang-mapped classes, everything else runs intermediary.
+  MappingSet m;
+  if (loader == "forge" || loader == "neoforge") {
+    m = builtinOfficial();
+    spdlog::info("mappings: using built-in official (Forge/NeoForge) names for '{}'", version);
+  } else {
+    m = builtin1211();
+    if (version != "unknown" && version != m.version)
+      spdlog::warn("mappings: no table for version '{}', using built-in '{}' IDs "
+                   "(field offsets may mismatch)",
+                   version, m.version);
+  }
   return m;
 }
 
