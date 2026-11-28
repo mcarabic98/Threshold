@@ -30,8 +30,9 @@ struct EspEntity {
   std::string className; // intermediary class id, e.g. net/minecraft/class_1642
   int category = 5;      // EntCat
   bool self = false;     // local player
-  double cur[3] = {0, 0, 0};  // current tick position (Vec3)
-  double prev[3] = {0, 0, 0}; // previous tick position (xo/yo/zo)
+  double cur[3] = {0, 0, 0};      // current tick position (Vec3)
+  double prev[3] = {0, 0, 0};     // previous tick position (xo/yo/zo)
+  double rendered[3] = {0, 0, 0}; // smoothed render position (chases the interp)
   double bbMin[3] = {0, 0, 0};
   double bbMax[3] = {0, 0, 0};
 };
@@ -66,6 +67,17 @@ public:
   // elapsed, estimated from observed entity position changes. Renderers use
   // it exactly like the game's partialTick.
   double tickPartial() const;
+  // InstanceKlass* captured by the last scan for a probe class name
+  // (registered as a scan target), 0 when absent.
+  uint64_t probeKlass(const std::string& name) const;
+  // Find an InstanceKlass by name through the constant pools of host classes
+  // (resolved Class entries hold the Klass*). Used for classes with no heap
+  // instances (static-only mod state), which the object scan cannot see.
+  uint64_t findKlassByCP(const mem::Process& p, const std::vector<uint64_t>& hosts,
+                         const std::string& name);
+  // Static primitive fields live in the java mirror: read one double/long.
+  bool readStaticDouble(const mem::Process& p, uint64_t klass, const std::string& name,
+                        double* out);
   float readFov(const mem::Process& p);       // degrees, 70 fallback (heap chain)
   float readFovFromFile(const mem::Process& p); // degrees from options.txt (PEB cwd)
   void setGameVersion(const std::string& v) { gameVersion_ = v; }
@@ -119,14 +131,19 @@ private:
 
   // Per-entity tick interpolation: prev = our previous-frame cur (exactly the
   // game's xo/yo/zo semantics), phase from the latest observed position
-  // change (entity ticks are synchronized across the world).
+  // change (entity ticks are synchronized across the world). rend is the
+  // temporally smoothed render position (chases the interpolated target) —
+  // it absorbs the small phase errors that would otherwise show as jitter.
   struct EntTick {
     bool has = false;
     double cur[3] = {0, 0, 0};
     double prev[3] = {0, 0, 0};
+    double rend[3] = {0, 0, 0};
+    std::chrono::steady_clock::time_point rendAt{};
   };
   std::map<uint64_t, EntTick> entTick_;
   std::chrono::steady_clock::time_point lastTickChange_{};
+  std::map<std::string, uint64_t> probeKlass_; // from scan.targetKlass
   int64_t offFovOpt_ = -1;                          // fov OptionInstance inside Options
   int64_t offOptValue_ = -1;                        // OptionInstance.value (Object)
   int64_t doubleValue_ = -1;                        // java/lang/Double.value (D)

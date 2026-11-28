@@ -474,6 +474,7 @@ const HeapReader::KlassInfo& HeapReader::resolve(uint64_t key, WalkCtx& ctx, Sca
   for (size_t i = 0; i < targets.size(); ++i)
     if (ki.name == targets[i]) {
       ki.targetIdx = (int)i;
+      if (ctx.klassAddr.size() > i && ctx.klassAddr[i] == 0) ctx.klassAddr[i] = key;
       break;
     }
   std::lock_guard g(st.mtx);
@@ -738,6 +739,7 @@ HeapScanResult HeapReader::scan(const mem::Process& p, const JvmRuntime& rt,
   for (auto& c : ctxs) {
     c.local.reserve(1 << 16);
     c.addrs.resize(targets.size());
+    c.klassAddr.assign(targets.size(), 0);
     c.counts.assign(targets.size(), 0);
   }
   std::vector<std::thread> threads;
@@ -826,6 +828,8 @@ HeapScanResult HeapReader::scan(const mem::Process& p, const JvmRuntime& rt,
         if (dst.size() >= kMaxAddrsPerTarget) break;
         dst.push_back(a);
       }
+      if (c.klassAddr[i] && !r.targetKlass.count(targets[i]))
+        r.targetKlass[targets[i]] = c.klassAddr[i];
     }
   }
   for (auto& [name, cnt] : r.targetCounts)
@@ -838,6 +842,7 @@ HeapScanResult HeapReader::scan(const mem::Process& p, const JvmRuntime& rt,
     WalkCtx ctx;
     ctx.local.reserve(1 << 16);
     ctx.addrs.resize(targets.size());
+    ctx.klassAddr.assign(targets.size(), 0);
     ctx.counts.assign(targets.size(), 0);
     for (uint64_t a = heapStart_; a < heapEnd_; a += kFallbackChunk) {
       if (cancel && cancel->load()) break;

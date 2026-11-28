@@ -4,6 +4,7 @@
 #include <chrono>
 #include <spdlog/spdlog.h>
 
+#include "core/util.h"
 #include "ui/theme.h"
 
 namespace mods {
@@ -36,6 +37,43 @@ void FovModule::update(const ModuleContext& ctx) {
       spdlog::debug("fov module: cached {:.1f} deg", cachedFov_);
     }
     effectiveFov_ = std::clamp(cachedFov_, 30.f, 170.f);
+
+    // Zoom compensation: OkZoomer-style mods keep an animated zoom divisor
+    // (fov_eff = fov_base / divisor) in a static field. The class is probed
+    // by the heap scan; static-only classes (no heap instances) are found
+    // through the constant pools of sibling mod classes. The divisor is read
+    // per frame because it eases while zooming. Nothing found -> divisor = 1.
+    double divisor = 1.0;
+    static const char* kZoomClass = "page/langeweile/ok_zoomer/zoom/Zoom";
+    static const char* kZoomHosts[] = {
+        "page/langeweile/ok_zoomer/OkZoomerClientMod",
+        "page/langeweile/ok_zoomer/utils/ZoomUtils",
+        "page/langeweile/ok_zoomer/utils/ForgeZoomUtils",
+        "page/langeweile/ok_zoomer/events/ManageZoomEvent",
+        "page/langeweile/ok_zoomer/zoom/Zoom",
+    };
+    uint64_t zk = 0;
+    for (const char* zn : kZoomHosts)
+      if ((zk = ctx.model->probeKlass(zn)) != 0) break;
+    if (!zk) {
+      std::vector<uint64_t> hosts;
+      for (const char* hn : kZoomHosts)
+        if (uint64_t h = ctx.model->probeKlass(hn)) hosts.push_back(h);
+      zk = ctx.model->findKlassByCP(*ctx.proc, hosts, kZoomClass);
+    }
+    if (zk) {
+      double d = 0;
+      if (ctx.model->readStaticDouble(*ctx.proc, zk, "zoomDivisor", &d) && d > 0.01)
+        divisor = d;
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        spdlog::info("zoom: state klass @ {} divisor={:.3f}", util::hex(zk), divisor);
+      }
+    }
+    zoomDivisor_ = divisor;
+    effectiveFov_ = std::clamp(effectiveFov_ / (float)std::clamp(zoomDivisor_, 0.05, 64.0),
+                               1.f, 170.f);
   } else {
     effectiveFov_ = cachedFov_;
   }
@@ -46,6 +84,7 @@ void FovModule::update(const ModuleContext& ctx) {
         {"FOV", std::format("{:.1f}°", effectiveFov_)},
         {"Mode", fovManual ? "Manual" : "Auto"},
         {"Source", fovManual ? "Setting" : "Game"},
+        {"Zoom", std::format("x{:.2f}", zoomDivisor_)},
     };
   }
 }

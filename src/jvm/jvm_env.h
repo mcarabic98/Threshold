@@ -23,6 +23,7 @@ struct JvmEnv {
   // Klass / Symbol offsets
   int64_t offKlassName = -1;         // Klass::_name -> Symbol*
   int64_t offKlassLayoutHelper = -1; // Klass::_layout_helper (jint)
+  int64_t offKlassMirror = -1;       // InstanceKlass::_java_mirror (statics live here)
   int64_t offSymbolLength = -1;      // Symbol::_length (u2)
   int64_t offSymbolBody = -1;        // Symbol::_body (bytes)
 

@@ -22,6 +22,7 @@ struct HeapScanResult {
   size_t mcObjects = 0; // "net/minecraft/" prefix hits
   std::map<std::string, size_t> targetCounts;
   std::map<std::string, std::vector<uint64_t>> targetAddrs; // first 16 instances each
+  std::map<std::string, uint64_t> targetKlass; // InstanceKlass* per matched target name
 };
 
 // Walks the live Java heap externally — G1 region list via VMStructs, with a
@@ -61,6 +62,7 @@ private:
   struct WalkCtx {
     KlassCache local;
     std::vector<std::vector<uint64_t>> addrs; // per target
+    std::vector<uint64_t> klassAddr;          // per target: InstanceKlass* (first hit)
     std::vector<size_t> counts;               // per target
     size_t objects = 0, mc = 0, regions = 0, resync = 0, named = 0;
   };

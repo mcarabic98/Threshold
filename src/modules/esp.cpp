@@ -56,6 +56,7 @@ EspModule::EspModule()
   addBool("players", "Игроки", true);
   addBool("items", "Предметы", false);
   addBool("misc", "Прочее", false);
+  addBool("selfbox", "Свой бокс", false);
 }
 
 void EspModule::update(const ModuleContext& ctx) {
@@ -82,7 +83,7 @@ void EspModule::update(const ModuleContext& ctx) {
                                      ddz = mz - cam.pos[2];
                               double dst = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
                               if (dst > maxDist) return true;
-                              if (e.self) return false; // self always shown
+                              if (e.self && !boolVal("selfbox", false)) return true;
                               switch (e.category) {
                                 case (int)mc::EntCat::Mob: return !showMobs;
                                 case (int)mc::EntCat::Player: return !showPlayers;
@@ -137,19 +138,16 @@ void EspModule::update(const ModuleContext& ctx) {
   ImDrawList* dl = ImGui::GetForegroundDrawList();
   ImU32 colorTxt = IM_COL32(255, 255, 255, 230);
 
-  // tick-rate interpolation: MC renders prev + (cur - prev) * partialTick.
-  // prev/cur come from the model's per-entity tick cache and the phase from
-  // the latest observed position change across entities — correct even when
-  // the local player stands still. The AABB matches cur, so the render shift
-  // is delta * (partial - 1).
-  double partial = model.tickPartial();
-  double interp = partial - 1.0;
-
+  // Render positions come from the model's tick cache: the interpolated
+  // target follows the game's own prev + (cur - prev) * partialTick formula,
+  // and a short chase-smoother (GameModel) absorbs the residual phase error
+  // from RPM latency. The AABB matches cur, so the render shift is
+  // rendered - cur.
   double cx2 = cam.pos[0], cy2 = cam.pos[1], cz2 = cam.pos[2];
   for (auto& e : ents) {
-    double dx = (e.cur[0] - e.prev[0]) * interp;
-    double dy = (e.cur[1] - e.prev[1]) * interp;
-    double dz = (e.cur[2] - e.prev[2]) * interp;
+    double dx = e.rendered[0] - e.cur[0];
+    double dy = e.rendered[1] - e.cur[1];
+    double dz = e.rendered[2] - e.cur[2];
     // project the 8 AABB corners, shifted by the interpolation delta
     ImVec2 minS(1e9f, 1e9f), maxS(-1e9f, -1e9f);
     int okCount = 0;

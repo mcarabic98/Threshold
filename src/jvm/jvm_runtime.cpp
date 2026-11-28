@@ -525,6 +525,7 @@ void JvmRuntime::buildEnv(const mem::Process& proc) {
 
   if (auto v = structs_.field("Klass", "_name")) e.offKlassName = *v;
   if (auto v = structs_.field("Klass", "_layout_helper")) e.offKlassLayoutHelper = *v;
+  if (auto v = structs_.field("InstanceKlass", "_java_mirror")) e.offKlassMirror = *v;
   if (auto v = structs_.field("Symbol", "_length")) e.offSymbolLength = *v;
   if (auto v = structs_.field("Symbol", "_body")) e.offSymbolBody = *v;
 

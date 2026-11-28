@@ -225,6 +225,10 @@ bool GameModel::init(const mem::Process& p, jvm::JvmRuntime& rt, jvm::KlassReade
     }
   }
 
+  // Klass addresses captured by the scan for probe names (mod state classes
+  // like ok_zoomer's Zoom) — used by readStaticDouble consumers.
+  probeKlass_ = scan.targetKlass;
+
   valid_ = true;
   p_ = &p;
   rt_ = &rt;
@@ -1005,7 +1009,9 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out,
       // game's xo/yo/zo semantics, independent of the xo field heuristic. The
       // phase (tickPartial) is estimated from the latest change across all
       // entities (world ticks are synchronized), so it stays correct even
-      // when the local player stands still.
+      // when the local player stands still. rend chases the interpolated
+      // position with a short time constant — absorbs the residual phase
+      // error (RPM latency) that would otherwise show as box jitter.
       auto nowTick = std::chrono::steady_clock::now();
       auto& tk = entTick_[obj];
       if (!tk.has) {
@@ -1013,6 +1019,9 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out,
         tk.cur[0] = tk.prev[0] = e.cur[0];
         tk.cur[1] = tk.prev[1] = e.cur[1];
         tk.cur[2] = tk.prev[2] = e.cur[2];
+        tk.rend[0] = e.cur[0];
+        tk.rend[1] = e.cur[1];
+        tk.rend[2] = e.cur[2];
       } else if (tk.cur[0] != e.cur[0] || tk.cur[1] != e.cur[1] || tk.cur[2] != e.cur[2]) {
         tk.prev[0] = tk.cur[0];
         tk.prev[1] = tk.cur[1];
@@ -1025,6 +1034,25 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out,
       e.prev[0] = tk.prev[0];
       e.prev[1] = tk.prev[1];
       e.prev[2] = tk.prev[2];
+
+      // Smoothed render position: target = prev + (cur - prev) * partialTick
+      // (the game's own formula). Chase it with ~25/s time constant; multiple
+      // readEntities calls per frame are guarded by the 2 ms stamp.
+      double pt = tickPartial();
+      double target[3] = {tk.prev[0] + (tk.cur[0] - tk.prev[0]) * pt,
+                          tk.prev[1] + (tk.cur[1] - tk.prev[1]) * pt,
+                          tk.prev[2] + (tk.cur[2] - tk.prev[2]) * pt};
+      if (std::chrono::duration<double>(nowTick - tk.rendAt).count() >= 0.002) {
+        double alpha = 1.0 - std::exp(-0.04 * 25.0); // 25/s per 40 ms mean frame
+        auto dtms = std::chrono::duration<double>(nowTick - tk.rendAt).count();
+        if (tk.rendAt.time_since_epoch().count() != 0)
+          alpha = 1.0 - std::exp(-std::clamp(dtms, 0.0, 0.1) * 25.0);
+        for (int c = 0; c < 3; ++c) tk.rend[c] += (target[c] - tk.rend[c]) * alpha;
+        tk.rendAt = nowTick;
+      }
+      e.rendered[0] = tk.rend[0];
+      e.rendered[1] = tk.rend[1];
+      e.rendered[2] = tk.rend[2];
       if (entTick_.size() > 4096) {
         // prune entities that left the world (not seen this pass)
         std::set<uint64_t> alive;
@@ -1100,6 +1128,74 @@ double GameModel::tickPartial() const {
                  .count() /
              0.05;
   return std::clamp(t, 0.0, 1.0);
+}
+
+uint64_t GameModel::probeKlass(const std::string& name) const {
+  auto it = probeKlass_.find(name);
+  return it == probeKlass_.end() ? 0 : it->second;
+}
+
+// Find an InstanceKlass by name through the constant pools of host classes:
+// resolved Class entries store the Klass* directly, so scanning a host's CP
+// for a klass whose name matches finds classes that never have heap
+// instances (static-only mod state classes).
+uint64_t GameModel::findKlassByCP(const mem::Process& p, const std::vector<uint64_t>& hosts,
+                                  const std::string& name) {
+  if (!rt_) return 0;
+  auto& st = rt_->structs();
+  const JvmEnv& env = rt_->env();
+  auto cOff = st.field("InstanceKlass", "_constants");
+  if (!cOff) return 0;
+  // CP length via VMStructs when described; otherwise a safe bound (entries
+  // beyond the real length fail the plausibility checks below).
+  int64_t cpLenOff = st.field("ConstantPool", "_length").value_or(-1);
+
+  for (uint64_t host : hosts) {
+    if (!host) continue;
+    auto cpv = p.read<uint64_t>((uintptr_t)(host + (uint64_t)*cOff));
+    if (!cpv || !*cpv) continue;
+    uint64_t cp = *cpv;
+    size_t n = 1024;
+    if (cpLenOff >= 0) {
+      auto l = p.read<uint32_t>((uintptr_t)(cp + (uint64_t)cpLenOff));
+      if (l && *l) n = std::min<size_t>(*l, 4096);
+    }
+    for (size_t i = 0; i < n; ++i) {
+      auto e = p.read<uint64_t>((uintptr_t)(cp + 80 + i * 8));
+      if (!e || *e < 0x10000) continue;
+      uint64_t v = *e;
+      // resolved klass pointers are 8-aligned; tags/index encodings are not
+      if (v & 0x7) continue;
+      auto lh = p.read<uint32_t>((uintptr_t)(v + (uint64_t)env.offKlassLayoutHelper));
+      if (!lh || !*lh || *lh < 16 || *lh > (1u << 26)) continue;
+      if (env.offKlassName < 0) continue;
+      auto sym = p.read<uint64_t>((uintptr_t)(v + (uint64_t)env.offKlassName));
+      if (!sym || !*sym) continue;
+      auto nm = rt_->readSymbol(p, *sym);
+      if (nm && *nm == name) return v;
+    }
+  }
+  return 0;
+}
+
+bool GameModel::readStaticDouble(const mem::Process& p, uint64_t klass, const std::string& name,
+                                 double* out) {
+  if (!klass || !rt_ || !kr_) return false;
+  const JvmEnv& env = rt_->env();
+  if (env.offKlassMirror < 0) return false;
+  auto mirror = p.read<uint64_t>((uintptr_t)(klass + (uint64_t)env.offKlassMirror));
+  if (!mirror || !*mirror) return false;
+  std::vector<jvm::FieldDesc> fs;
+  std::string err;
+  if (!kr_->readFields(p, *rt_, klass, fs, &err)) return false;
+  for (auto& f : fs) {
+    if (!f.isStatic || f.name != name) continue;
+    if (auto v = p.read<double>((uintptr_t)(*mirror + (uint64_t)f.offset))) {
+      *out = *v;
+      return true;
+    }
+  }
+  return false;
 }
 
 float GameModel::readFovFromFile(const mem::Process& p) {

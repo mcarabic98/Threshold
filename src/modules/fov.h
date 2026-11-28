@@ -23,6 +23,7 @@ public:
 private:
   float effectiveFov_ = 70.f;
   float cachedFov_ = 70.f;
+  double zoomDivisor_ = 1.0; // animated fov divisor from a zoom mod (1 = none)
   std::chrono::steady_clock::time_point lastFovRead_{};
 };
 

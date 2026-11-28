@@ -72,9 +72,6 @@ void RadarModule::update(const ModuleContext& ctx) {
   std::vector<mc::EspEntity> ents;
   double origin[3] = {ctx.player.x, ctx.player.y, ctx.player.z};
   if (!ctx.model->readEntities(*ctx.proc, ents, origin, range)) return;
-  // same interpolation as ESP: rendered position = cur + delta*(partial-1)
-  double partial = ctx.model->tickPartial();
-  double interp = partial - 1.0;
   for (const auto& e : ents) {
     if (e.self) continue;
     switch (e.category) {
@@ -84,8 +81,9 @@ void RadarModule::update(const ModuleContext& ctx) {
       default: if (!showMisc) continue; break;
     }
 
-    double ex = (e.bbMin[0] + e.bbMax[0]) * 0.5 + (e.cur[0] - e.prev[0]) * interp;
-    double ez = (e.bbMin[2] + e.bbMax[2]) * 0.5 + (e.cur[2] - e.prev[2]) * interp;
+    // smoothed render position (same cache as ESP), centered on the AABB
+    double ex = (e.bbMin[0] + e.bbMax[0]) * 0.5 + (e.rendered[0] - e.cur[0]);
+    double ez = (e.bbMin[2] + e.bbMax[2]) * 0.5 + (e.rendered[2] - e.cur[2]);
     float dx = float(ex - ctx.player.x);
     float dz = float(ez - ctx.player.z);
 

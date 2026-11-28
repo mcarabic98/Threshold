@@ -155,6 +155,17 @@ void App::tryAttach() {
   {
     std::set<std::string> s;
     for (auto& [k, n] : mapping_.classes) s.insert(n);
+    // Probe classes whose InstanceKlass* is needed later (zoom state etc.) —
+    // the scan records their klass address by name (see HeapScanResult).
+    // ok_zoomer classes: hosts for the CP-walk + the Zoom state itself.
+    for (const char* probe : {
+             "page/langeweile/ok_zoomer/OkZoomerClientMod",
+             "page/langeweile/ok_zoomer/utils/ZoomUtils",
+             "page/langeweile/ok_zoomer/utils/ForgeZoomUtils",
+             "page/langeweile/ok_zoomer/events/ManageZoomEvent",
+             "page/langeweile/ok_zoomer/zoom/Zoom",
+         })
+      s.insert(probe);
     targets_.assign(s.begin(), s.end());
   }
 
