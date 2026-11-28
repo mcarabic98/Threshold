@@ -899,13 +899,15 @@ std::vector<uint64_t> GameModel::findEntityMaps(const mem::Process& p, uint64_t 
   return maps;
 }
 
-bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out) {
+bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out,
+                             const double origin[3], double maxDist) {
   out.clear();
   if (!valid_ || offLevel_ < 0 || offPositionVec_ < 0 || offBB_ < 0) {
     return false;
   }
   const JvmEnv& env = rt_->env();
   (void)env;
+  const double maxDist2 = maxDist * maxDist;
 
   auto lvRaw = p.read<uint32_t>((uintptr_t)(mcInstance_ + (uint64_t)offLevel_));
   if (!lvRaw || !*lvRaw) return false;
@@ -1035,6 +1037,15 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
             ++it;
         }
       }
+
+      // Distance gate BEFORE the expensive reads (xo + AABB): the world maps
+      // hold every tracked entity (hundreds), and a hard cap used to truncate
+      // the list in hash order - nearby mobs could be cut off entirely. Now
+      // far entities are skipped cheaply and near ones always make the list.
+      double ddx = e.cur[0] - origin[0], ddy = e.cur[1] - origin[1],
+             ddz = e.cur[2] - origin[2];
+      if (ddx * ddx + ddy * ddy + ddz * ddz > maxDist2) continue;
+
       bool pok = true;
       for (int c = 0; c < 3; ++c) {
         int64_t off = c == 0 ? prevX_ : c == 1 ? prevY_ : prevZ_;
@@ -1072,7 +1083,7 @@ bool GameModel::readEntities(const mem::Process& p, std::vector<EspEntity>& out)
       if (!ok) continue;
       ++statBB;
       out.push_back(std::move(e));
-      if (out.size() >= 256) return true;
+      if (out.size() >= 2048) return true;
     }
   }
   static std::chrono::steady_clock::time_point lastParsedLog{};

@@ -70,7 +70,8 @@ void RadarModule::update(const ModuleContext& ctx) {
 
   int shown = 0;
   std::vector<mc::EspEntity> ents;
-  if (!ctx.model->readEntities(*ctx.proc, ents)) return;
+  double origin[3] = {ctx.player.x, ctx.player.y, ctx.player.z};
+  if (!ctx.model->readEntities(*ctx.proc, ents, origin, range)) return;
   // same interpolation as ESP: rendered position = cur + delta*(partial-1)
   double partial = ctx.model->tickPartial();
   double interp = partial - 1.0;

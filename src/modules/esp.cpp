@@ -70,7 +70,7 @@ void EspModule::update(const ModuleContext& ctx) {
   mc::CameraSnapshot cam;
   if (!model.readCamera(proc, cam) || !cam.valid) return;
   std::vector<mc::EspEntity> ents;
-  if (!model.readEntities(proc, ents)) return;
+  if (!model.readEntities(proc, ents, cam.pos, maxDist)) return;
 
   // apply category + distance filters
   ents.erase(std::remove_if(ents.begin(), ents.end(),

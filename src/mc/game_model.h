@@ -60,7 +60,8 @@ public:
 
   bool readPlayer(const mem::Process& p, EntitySnapshot& out);
   bool readCamera(const mem::Process& p, CameraSnapshot& out);
-  bool readEntities(const mem::Process& p, std::vector<EspEntity>& out);
+  bool readEntities(const mem::Process& p, std::vector<EspEntity>& out,
+                    const double origin[3], double maxDist);
   // Tick-interpolation phase in [0, 1]: fraction of the current 50 ms tick
   // elapsed, estimated from observed entity position changes. Renderers use
   // it exactly like the game's partialTick.

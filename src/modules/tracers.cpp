@@ -93,7 +93,8 @@ void TracersModule::update(const ModuleContext& ctx) {
   ImVec2 origin(screen.x * 0.5f, screen.y * 0.5f);
 
   std::vector<mc::EspEntity> ents;
-  if (!ctx.model->readEntities(*ctx.proc, ents)) return;
+  double viewOrigin[3] = {cam.pos[0], cam.pos[1], cam.pos[2]};
+  if (!ctx.model->readEntities(*ctx.proc, ents, viewOrigin, 128.f)) return;
   for (const auto& e : ents) {
     if (e.self) continue;
     int cat = e.category & 7;
